@@ -1,4 +1,5 @@
 mod store;
+mod tray;
 
 use std::{
     ffi::CString,
@@ -50,6 +51,18 @@ enum Command {
     },
     /// Show totals per project, including open sessions through their last checkpoint
     Report,
+    /// Show a hardware-controlled system tray (select a project, then insert/remove the card)
+    Tray {
+        /// Open keyboard-accessible controls immediately
+        #[arg(long)]
+        controls: bool,
+        /// Exact PC/SC reader name; empty in the tray settings restores automatic selection
+        #[arg(long)]
+        reader: Option<String>,
+        /// ATR to match (card type, NOT a unique physical-card ID)
+        #[arg(long, default_value = TARGET_ATR)]
+        atr: String,
+    },
 }
 
 fn parse_atr(input: &str) -> Result<Vec<u8>, String> {
@@ -113,7 +126,9 @@ fn select_reader(mut readers: Vec<CString>, requested: Option<&str>) -> Result<C
     Ok(readers.remove(0))
 }
 
-fn scan() -> Result<()> {
+fn scan_text() -> Result<String> {
+    use std::fmt::Write;
+    let mut output = String::new();
     let ctx = context()?;
     let mut states: Vec<_> = readers(&ctx)?
         .into_iter()
@@ -121,14 +136,14 @@ fn scan() -> Result<()> {
         .collect();
     ctx.get_status_change(POLL_INTERVAL, &mut states)?;
     for state in states {
-        println!("Reader: {}", state.name().to_string_lossy());
+        writeln!(output, "Reader: {}", state.name().to_string_lossy())?;
         if state.event_state().contains(State::PRESENT) {
-            println!("  ATR: {}", format_atr(state.atr()));
+            writeln!(output, "  ATR: {}", format_atr(state.atr()))?;
         } else {
-            println!("  No card present ({:?})", state.event_state());
+            writeln!(output, "  No card present ({:?})", state.event_state())?;
         }
     }
-    Ok(())
+    Ok(output)
 }
 
 fn matches_target(state: State, atr: &[u8], target: &[u8]) -> bool {
@@ -160,12 +175,22 @@ fn watcher_lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn watch(path: &Path, project: &str, requested: Option<&str>, atr: &[u8]) -> Result<()> {
-    ensure!(!project.trim().is_empty(), "Project name cannot be blank");
-    let running = Arc::new(AtomicBool::new(true));
-    let flag = Arc::clone(&running);
-    ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchState {
+    Waiting,
+    Tracking,
+    CardAbsent,
+}
 
+fn watch(
+    path: &Path,
+    project: &str,
+    requested: Option<&str>,
+    atr: &[u8],
+    running: &AtomicBool,
+    mut status: impl FnMut(WatchState),
+) -> Result<()> {
+    ensure!(!project.trim().is_empty(), "Project name cannot be blank");
     let mut store = store::Store::open(path).context("Cannot initialize SQLite database")?;
     let _lock = watcher_lock(path)?;
     let recovered = store.recover()?;
@@ -175,16 +200,15 @@ fn watch(path: &Path, project: &str, requested: Option<&str>, atr: &[u8]) -> Res
         );
     }
 
-    let result = monitor(&mut store, project, requested, atr, &running);
-    // On errors, do not count time after the last confirmed presence.
-    let stop_time = if result.is_ok() { Some(now()?) } else { None };
+    let result = monitor(&mut store, project, requested, atr, running, &mut status);
+    // Never count shutdown/SQLite wait time after the last confirmed presence.
     if store.stop(
         if result.is_ok() {
             "shutdown"
         } else {
             "reader_error"
         },
-        stop_time,
+        None,
     )? {
         println!("Stopped {project:?}.");
     }
@@ -197,6 +221,7 @@ fn monitor(
     requested: Option<&str>,
     target: &[u8],
     running: &AtomicBool,
+    status: &mut impl FnMut(WatchState),
 ) -> Result<()> {
     let ctx = context()?;
     let name = select_reader(readers(&ctx)?, requested)?;
@@ -207,6 +232,8 @@ fn monitor(
     eprintln!("ATR matching identifies a card type, not a unique card. Press Ctrl-C to stop.");
     let mut states = [ReaderState::new(name, State::UNAWARE)];
     let mut previous = None;
+    let mut seen_target = false;
+    status(WatchState::Waiting);
     while running.load(Ordering::SeqCst) {
         match ctx.get_status_change(POLL_INTERVAL, &mut states) {
             Ok(()) | Err(pcsc::Error::Timeout) => {}
@@ -214,6 +241,9 @@ fn monitor(
                 return Err(error)
                     .context("PC/SC monitoring failed; reconnect the reader and restart watch");
             }
+        }
+        if !running.load(Ordering::SeqCst) {
+            break;
         }
         let state = &mut states[0];
         let flags = state.event_state();
@@ -232,9 +262,17 @@ fn monitor(
             if store.record(project, &atr, &reader, now()?)? {
                 println!("Started {project:?}.");
             }
-        } else if store.stop("removed_or_changed", Some(now()?))? {
+        } else if store.stop("removed_or_changed", None)? {
             println!("Paused {project:?}; waiting for target card insertion to resume.");
         }
+        seen_target |= matching;
+        status(if matching {
+            WatchState::Tracking
+        } else if seen_target {
+            WatchState::CardAbsent
+        } else {
+            WatchState::Waiting
+        });
         previous = Some((matching, count));
         state.sync_current_state();
     }
@@ -244,14 +282,28 @@ fn monitor(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan => scan(),
+        Command::Scan => {
+            print!("{}", scan_text()?);
+            Ok(())
+        }
         Command::Watch {
             project,
             reader,
             atr,
         } => {
             let atr = parse_atr(&atr).map_err(anyhow::Error::msg)?;
-            watch(&cli.db, &project, reader.as_deref(), &atr)
+            let running = Arc::new(AtomicBool::new(true));
+            let flag = Arc::clone(&running);
+            ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))?;
+            watch(&cli.db, &project, reader.as_deref(), &atr, &running, |_| {})
+        }
+        Command::Tray {
+            reader,
+            atr,
+            controls,
+        } => {
+            let atr = parse_atr(&atr).map_err(anyhow::Error::msg)?;
+            tray::run(cli.db, reader, atr, controls)
         }
         Command::Report => {
             store::report(&cli.db).context("Cannot read report; run watch first or check --db")
@@ -347,6 +399,12 @@ mod tests {
         drop(lock);
         drop(watcher_lock(&db).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keyboard_controls_are_available_at_tray_launch() {
+        let cli = Cli::try_parse_from(["timeclock", "tray", "--controls"]).unwrap();
+        assert!(matches!(cli.command, Command::Tray { controls: true, .. }));
     }
 
     #[test]

@@ -1,8 +1,7 @@
 # Smartcard time clock
 
-A local Rust CLI: insert the target card to track time on a named project; remove it
-to pause. Reinsert it to resume the same project. Sessions are stored in SQLite. No network, GUI, or privileged access to the
-card is needed.
+A local Rust CLI with an optional system-tray menu: insert the target card to track time on a named project; remove it
+to pause. Reinsert it to resume the same project. Sessions are stored in SQLite. No network or privileged access to the card is needed. The CLI does not require a GUI.
 
 ## Card identity: ATR is not a serial number
 
@@ -36,7 +35,8 @@ data from your card.
 3. Persist project, ATR, reader, UTC Unix start/checkpoint/end timestamps (seconds),
    and stop reason in `sessions`. A partial unique index permits only one open
    session. A file lock permits only one watcher per database; reports remain usable.
-4. Checkpoint once per second while present. Ctrl-C/SIGTERM closes the session.
+4. Checkpoint once per second while present. Removal and Ctrl-C/SIGTERM close at
+   the last confirmed-presence checkpoint, never after a blocked SQLite write.
    Reader/PC/SC failure closes at the last checkpoint and exits with an error; reconnect
    the reader and restart the watcher. On the next watch run after a crash or power
    loss, close any unfinished session at its last checkpoint, not at restart time.
@@ -49,7 +49,7 @@ The host must have a working `pcscd` service and reader driver (as it already do
 if `pcsc_scan` works). On NixOS, enable `services.pcscd.enable = true;` in the host
 configuration if needed. Do not start a second pcscd inside the development shell.
 
-`devenv.nix` supplies Rust, pkg-config, pcsclite, pcsc-tools, and SQLite:
+`devenv.nix` supplies Rust, pkg-config, pcsclite, pcsc-tools, SQLite, Zenity, and DBus tools:
 
 ```sh
 devenv shell
@@ -75,6 +75,119 @@ cargo run -- --db ./work.sqlite3 report
 
 `--atr` also accepts compact or colon-separated hex. Change projects by stopping
 `watch` and starting it with another project name. There is no enrollment step.
+
+### System tray (DMS / DankMaterialShell)
+
+From the development shell, in your graphical session:
+
+```sh
+cargo run -- --db /absolute/path/to/work.sqlite3 tray
+# The same reader/ATR overrides are available at launch:
+cargo run -- --db /absolute/path/to/work.sqlite3 tray \
+  --reader "Alcor Micro AU9540 00 00" --atr "3B:00"
+# Or build once and launch target/debug/smartcard-timeclock --db ... tray
+```
+
+The Rust process exports standard **StatusNotifierItem + DBusMenu** using `ksni`,
+like Discord/Signal. DMS's System Tray widget consumes these protocols; no DMS
+plugin, service, autostart entry, or desktop configuration change is installed.
+A session DBus and a running tray host are required. Zenity must be on PATH for
+dialogs (`devenv shell` supplies it). Keep the launching terminal open, or launch
+the built binary from your desktop launcher with an explicit absolute `--db`.
+
+**Keyboard access:** installed DMS 1.6.3 menus are mouse-oriented, not keyboard
+navigable. Choose **Keyboard controls…** in the tray to open a Zenity action list,
+or launch it directly without using the host menu:
+
+```sh
+cargo run -- --db /absolute/path/to/work.sqlite3 tray --controls
+```
+
+Use arrows/Tab and Enter for actions, including project selection/entry, scan,
+reports, settings and Quit. Project/settings actions are unavailable while tracking. The controls reopen after each action
+or entry/report dialog; Cancel on the action list closes only controls, not tracking.
+The action list shows a status snapshot refreshed when reopened (not a live timer);
+the tray keeps updating. Errors appear on the next action list. No DMS keybindings
+or configuration are changed. Screen-reader and visible keyboard behavior still
+require manual acceptance.
+
+**Launch is idle and does not create or recover a database.** Click the clock
+icon to open the menu (right-click also works). Choose an existing project under
+**Projects**, or **New project…** to enter a name. Selection automatically starts
+watching: insertion starts timing and removal stops timing. If the target card is
+already inserted, timing starts immediately. There are no manual Play/Pause or
+Start/Stop timer controls. Names are exact and case-sensitive. Projects come from the selected database's
+history plus the currently selected name. Unrecorded names disappear when you select
+another name; they are not a saved project registry.
+
+The menu and tooltip show **Tracking**, **Waiting for target card**,
+**Paused — card absent** (reinsertion resumes), **Select a project**, or **Error**.
+The icon is a status indicator, not a button: green clock hands mean tracking,
+an orange dot means waiting for the card, a grey clock means no project is armed,
+and a red cross means error. The menu always shows the selected project and
+absolute database path.
+
+**Project selection and settings become read-only while tracking.** Remove the
+target card to unlock them; selecting another project while absent automatically
+arms that project. A dialog opened before insertion cannot change the project or
+settings after tracking starts. Reports and reader scanning remain available.
+After a reader/lock/database error, inspect the error, fix its cause, and reselect
+the project to retry. Only one watcher runs at a time.
+
+**Scan readers…** shows exact reader names and ATRs without opening SQLite.
+**Report…** shows the same totals as the CLI in a selectable text dialog.
+**Settings** provides database path, exact reader name (empty = automatic), and
+ATR entry. Cancel leaves settings and tracking unchanged; invalid entries are
+rejected. Settings are editable only when not tracking. Accepting a valid change
+joins the previous watcher and automatically rearms the selected project; without
+a selected project, the tray stays idle. The watcher reuses the CLI's PC/SC,
+locking, checkpoint, recovery and SQLite logic, not a separate timer. There is no
+fallback to another database if the selected path fails. A missing database is
+created when a project is armed. Settings/project selection are in-memory for this run; use launch
+options to repeat nondefault database/reader/ATR choices.
+
+**Quit**, Ctrl-C and SIGTERM close the active session and reap any open dialogs.
+Switching and quitting may take roughly one polling interval (plus SQLite's busy
+wait), but that wait is not counted. Removal and shutdown close at the
+last confirmed-presence checkpoint, conservatively dropping the unobserved tail
+(normally up to one polling interval). Timing retains whole-second precision. Hard kill or power
+loss uses checkpoint recovery when a project is next armed. Keep the database `.lock` file
+in place; hard-linked database aliases and deleting a live lock file can defeat
+lock identity.
+
+#### Tray acceptance check (temporary data only)
+
+```sh
+test_dir=$(mktemp -d)
+cargo run -- --db "$test_dir/acceptance.sqlite3" tray --controls
+# After quitting, inspect if desired, then remove only this test directory:
+rm -r -- "$test_dir"
+```
+
+1. Confirm a visible clock icon in DMS; open the menu and verify the displayed
+   absolute path. Verify the Keyboard controls action list with arrows/Tab/Enter,
+   all controls and Zenity text entry/cancellation; do not expect keyboard
+   navigation in DMS’s own menu. Check screen-reader labels/focus manually.
+2. Use Scan readers; set the exact reader and target ATR. Enter/select a project
+   (also try underscores, spaces and Unicode). It must start watching automatically.
+3. Select with no card: Waiting. Insert the target: Tracking. Project selection and
+   settings must become read-only in both the tray and keyboard controls. Remove:
+   card-absent pause; selection becomes editable. Wait, reinsert, remove and check
+   Report: absent time must be excluded; reinsertion adds another session. A
+   different-ATR card is ignored. There must be no manual timer controls.
+4. Open a project-entry dialog while absent, insert the target, then submit the
+   dialog: the active project must not change. Remove the card and select another
+   project; insertion must start a session on that project without a Resume action.
+5. Try blank project/invalid ATR and Cancel settings: no unintended changes.
+   Change databases and confirm no writes go to the previous path. Test an invalid
+   path and a missing reader: an actionable error, not tracking or fallback.
+6. While tray watching is active, start a second CLI watcher **only against this
+   temporary database**: it must fail to acquire the lock. Quit the tray with a
+   dialog open, verify its dialog closes and reports show zero open sessions.
+   Repeat with Ctrl-C/SIGTERM. Ensure no test watcher remains before removing data.
+
+These visible-desktop, accessibility and physical-card checks cannot be replaced
+by the automated fake-observation and isolated-DBus tests.
 
 ### Pause and resume an unfinished project
 
@@ -123,6 +236,8 @@ sqlite3 timeclock.sqlite3 \
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+# Isolated protocol test (never put its fake watcher on the desktop bus):
+TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- cargo test isolated_protocol -- --ignored
 ```
 
 Sessions use whole-second wall-clock timestamps. Keep the system clock accurate;

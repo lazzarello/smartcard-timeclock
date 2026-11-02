@@ -64,7 +64,14 @@ impl Store {
     }
 }
 
-pub fn report(path: &Path) -> Result<()> {
+pub struct ReportRow {
+    pub project: String,
+    pub seconds: i64,
+    pub sessions: i64,
+    pub open: i64,
+}
+
+pub fn report_rows(path: &Path) -> Result<Vec<ReportRow>> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     let mut query = conn.prepare(
@@ -80,16 +87,42 @@ pub fn report(path: &Path) -> Result<()> {
             row.get::<_, i64>(3)?,
         ))
     })?;
-    println!("PROJECT\tTIME (HH:MM:SS)\tSESSIONS\tOPEN");
-    for row in rows {
+    rows.map(|row| {
         let (project, seconds, sessions, open) = row?;
-        println!(
+        Ok(ReportRow {
+            project,
+            seconds,
+            sessions,
+            open,
+        })
+    })
+    .collect()
+}
+
+pub fn report_text(rows: &[ReportRow]) -> String {
+    use std::fmt::Write;
+    let mut text = String::from("PROJECT\tTIME (HH:MM:SS)\tSESSIONS\tOPEN\n");
+    for ReportRow {
+        project,
+        seconds,
+        sessions,
+        open,
+    } in rows
+    {
+        writeln!(
+            text,
             "{project}\t{:02}:{:02}:{:02}\t{sessions}\t{open}",
             seconds / 3600,
             seconds / 60 % 60,
             seconds % 60
-        );
+        )
+        .unwrap();
     }
+    text
+}
+
+pub fn report(path: &Path) -> Result<()> {
+    print!("{}", report_text(&report_rows(path)?));
     Ok(())
 }
 
@@ -188,12 +221,63 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_wait_does_not_extend_removal_or_shutdown_past_observation() {
+        for reason in ["removed_or_changed", "shutdown"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("contended.db");
+            let mut store = Store::open(&db).unwrap();
+            store.record("work", "3B00", "fake", 10).unwrap();
+            let blocker = Connection::open(&db).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                tx.send(()).unwrap();
+                // Timestamp belongs to the observation, not completion of the blocked write.
+                store.record("work", "3B00", "fake", 12).unwrap();
+                store.stop(reason, None).unwrap();
+                store
+            });
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!worker.is_finished());
+            // Simulated removal/Pause while the checkpoint is blocked.
+            blocker.execute_batch("COMMIT").unwrap();
+            let store = worker.join().unwrap();
+            assert_eq!(rows(&store)[0], (10, 12, Some(12), Some(reason.into())));
+        }
+    }
+
+    #[test]
     fn backwards_clock_does_not_create_negative_durations() {
         let mut store = memory();
         store.record("work", "3B00", "reader", 10).unwrap();
         store.record("work", "3B00", "reader", 5).unwrap();
         store.stop("shutdown", Some(6)).unwrap();
         assert_eq!(rows(&store)[0], (10, 10, Some(10), Some("shutdown".into())));
+    }
+
+    #[test]
+    fn report_rows_are_read_only_preserve_names_and_do_not_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("report.db");
+        assert!(report_rows(&db).is_err());
+        assert!(!db.exists());
+        let mut store = Store::open(&db).unwrap();
+        let name = "client_项目 ' <&>";
+        store.record(name, "3B00", "fake", 10).unwrap();
+        store.record(name, "3B00", "fake", 15).unwrap();
+        let report = report_rows(&db).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].project, name);
+        assert_eq!(
+            (report[0].seconds, report[0].sessions, report[0].open),
+            (5, 1, 1)
+        );
+        assert_eq!(
+            report_text(&report),
+            format!("PROJECT\tTIME (HH:MM:SS)\tSESSIONS\tOPEN\n{name}\t00:00:05\t1\t1\n")
+        );
+        assert_eq!(rows(&store)[0].2, None);
     }
 
     #[test]

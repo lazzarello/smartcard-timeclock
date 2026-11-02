@@ -19,3 +19,6 @@ devenv.local.yaml
 *.sqlite3-wal
 *.sqlite3-shm
 *.sqlite3.lock
+
+# dynamic workflows
+/workflows/
