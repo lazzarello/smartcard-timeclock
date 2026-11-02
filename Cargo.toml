@@ -1,0 +1,12 @@
+[package]
+name = "smartcard-timeclock"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+pcsc = "2"
+rusqlite = "0.32"
