@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-test-build:
+    runs-on: ubuntu-latest
+    container: rust:1.89-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies and evaluation tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libpcsclite-dev libsqlite3-dev dbus dbus-bin
+          rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Evaluate with Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test tray protocol on an isolated bus
+        run: TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- cargo test --locked isolated_protocol -- --ignored
+      - name: Build release binary
+        run: |
+          cargo build --locked --release --bin smartcard-timeclock
+          target/release/smartcard-timeclock --help
+          tar -C target/release -czf smartcard-timeclock-linux-x86_64.tar.gz smartcard-timeclock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smartcard-timeclock-linux-x86_64
+          path: smartcard-timeclock-linux-x86_64.tar.gz
+          if-no-files-found: error
