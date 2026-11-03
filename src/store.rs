@@ -99,9 +99,27 @@ pub fn report_rows(path: &Path) -> Result<Vec<ReportRow>> {
     .collect()
 }
 
+pub fn format_duration(seconds: i64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 pub fn report_text(rows: &[ReportRow]) -> String {
     use std::fmt::Write;
-    let mut text = String::from("PROJECT\tTIME (HH:MM:SS)\tSESSIONS\tOPEN\n");
+    let project_width = rows
+        .iter()
+        .map(|row| row.project.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("PROJECT".len());
+    let mut text = format!(
+        "{:<project_width$}  TIME (HH:MM:SS)  SESSIONS  OPEN\n",
+        "PROJECT"
+    );
     for ReportRow {
         project,
         seconds,
@@ -111,10 +129,8 @@ pub fn report_text(rows: &[ReportRow]) -> String {
     {
         writeln!(
             text,
-            "{project}\t{:02}:{:02}:{:02}\t{sessions}\t{open}",
-            seconds / 3600,
-            seconds / 60 % 60,
-            seconds % 60
+            "{project:<project_width$}  {:>14}  {sessions:>8}  {open:>4}",
+            format_duration(*seconds)
         )
         .unwrap();
     }
@@ -275,9 +291,53 @@ mod tests {
         );
         assert_eq!(
             report_text(&report),
-            format!("PROJECT\tTIME (HH:MM:SS)\tSESSIONS\tOPEN\n{name}\t00:00:05\t1\t1\n")
+            format!(
+                "PROJECT          TIME (HH:MM:SS)  SESSIONS  OPEN\n{name}        00:00:05         1     1\n"
+            )
         );
         assert_eq!(rows(&store)[0].2, None);
+    }
+
+    #[test]
+    fn report_counts_each_insertion_for_its_project_not_heartbeats_or_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cycles.db");
+        let mut store = Store::open(&db).unwrap();
+        for (project, start) in [("work", 10), ("another project", 20), ("work", 30)] {
+            assert!(store.record(project, "3B00", "reader", start).unwrap());
+            assert!(!store.record(project, "3B00", "reader", start + 1).unwrap());
+            assert!(store.stop("removed_or_changed", None).unwrap());
+            assert!(!store.stop("removed_or_changed", None).unwrap());
+        }
+        let report = report_rows(&db).unwrap();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].project, "another project");
+        assert_eq!((report[0].sessions, report[0].open), (1, 0));
+        assert_eq!(report[1].project, "work");
+        assert_eq!((report[1].sessions, report[1].open), (2, 0));
+        assert_eq!(
+            report_text(&report),
+            "PROJECT          TIME (HH:MM:SS)  SESSIONS  OPEN\nanother project        00:00:01         1     0\nwork                   00:00:02         2     0\n"
+        );
+
+        assert!(store.record("work", "3B00", "reader", 40).unwrap());
+        let report = report_rows(&db).unwrap();
+        assert_eq!((report[0].sessions, report[0].open), (1, 0));
+        assert_eq!((report[1].sessions, report[1].open), (3, 1));
+    }
+
+    #[test]
+    fn duration_formatting_preserves_unbounded_hours() {
+        for (seconds, expected) in [
+            (0, "00:00:00"),
+            (59, "00:00:59"),
+            (60, "00:01:00"),
+            (3600, "01:00:00"),
+            (3723, "01:02:03"),
+            (360000, "100:00:00"),
+        ] {
+            assert_eq!(format_duration(seconds), expected);
+        }
     }
 
     #[test]

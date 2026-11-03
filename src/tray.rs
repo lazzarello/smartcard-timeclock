@@ -21,12 +21,10 @@ enum Status {
 impl Status {
     fn text(&self) -> String {
         match self {
-            Self::Idle => "Select a project to watch for the card".into(),
-            Self::Watching(WatchState::Waiting) => "Waiting for target card".into(),
+            Self::Idle => "Select project".into(),
+            Self::Watching(WatchState::Waiting) => "Waiting for card".into(),
             Self::Watching(WatchState::Tracking) => "Tracking".into(),
-            Self::Watching(WatchState::CardAbsent) => {
-                "Paused — card absent; watching for reinsertion".into()
-            }
+            Self::Watching(WatchState::CardAbsent) => "Paused".into(),
             Self::Error(error) => format!("Error — {error}"),
         }
     }
@@ -90,7 +88,6 @@ enum Entry {
 }
 #[derive(Clone)]
 enum Action {
-    Controls,
     Select(String),
     Entry(Entry),
     Scan,
@@ -103,37 +100,32 @@ struct Tray {
     tx: Sender<Action>,
     settings: Settings,
     projects: Vec<String>,
+    project_seconds: i64,
     status: Status,
-    notice: String,
     dialog_open: bool,
 }
 fn label(text: &str) -> String {
     text.replace('_', "__")
 }
 impl Tray {
+    fn status_title(&self) -> String {
+        if !self.settings.project.is_empty() {
+            let state = match self.status {
+                Status::Watching(WatchState::Tracking) => Some("tracking"),
+                Status::Watching(WatchState::CardAbsent) => Some("paused"),
+                _ => None,
+            };
+            if let Some(state) = state {
+                return format!(
+                    "Timeclock: {state} ({})",
+                    store::format_duration(self.project_seconds)
+                );
+            }
+        }
+        format!("Timeclock: {}", self.status.text())
+    }
     fn editable(&self) -> bool {
         self.status != Status::Watching(WatchState::Tracking)
-    }
-    fn control_choices(&self) -> Vec<(String, Action)> {
-        let mut choices = vec![
-            ("Scan readers…".into(), Action::Scan),
-            ("Report…".into(), Action::Report),
-            ("Quit timeclock".into(), Action::Quit),
-        ];
-        if self.editable() {
-            choices.extend([
-                ("New project…".into(), Action::Entry(Entry::Project)),
-                ("Database path…".into(), Action::Entry(Entry::Database)),
-                ("Exact reader…".into(), Action::Entry(Entry::Reader)),
-                ("Target ATR…".into(), Action::Entry(Entry::Atr)),
-            ]);
-            choices.extend(
-                self.projects
-                    .iter()
-                    .map(|p| (format!("Select project: {p}"), Action::Select(p.clone()))),
-            );
-        }
-        choices
     }
     fn item(&self, text: &str, action: Action, enabled: bool) -> MenuItem<Self> {
         StandardItem {
@@ -156,12 +148,15 @@ impl Tray {
     }
 }
 impl ksni::Tray for Tray {
-    const MENU_ON_ACTIVATE: bool = true;
+    const MENU_ON_ACTIVATE: bool = false;
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.tx.send(Action::Report);
+    }
     fn id(&self) -> String {
         "smartcard-timeclock".into()
     }
     fn title(&self) -> String {
-        format!("Timeclock: {}", self.status.text())
+        self.status_title()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
@@ -214,8 +209,6 @@ impl ksni::Tray for Tray {
             self.editable() && !self.dialog_open,
         ));
         vec![
-            self.item("Keyboard controls…", Action::Controls, !self.dialog_open),
-            Self::info(&self.status.text()),
             Self::info(&format!(
                 "Project: {}",
                 if self.settings.project.is_empty() {
@@ -224,10 +217,8 @@ impl ksni::Tray for Tray {
                     &self.settings.project
                 }
             )),
-            Self::info(&format!("Database: {}", self.settings.db.display())),
-            Self::info(&self.notice),
             SubMenu {
-                label: "Projects (read-only while tracking)".into(),
+                label: "Projects".into(),
                 enabled: self.editable(),
                 submenu: projects,
                 ..Default::default()
@@ -237,7 +228,7 @@ impl ksni::Tray for Tray {
             self.item("Scan readers…", Action::Scan, !self.dialog_open),
             self.item("Report…", Action::Report, !self.dialog_open),
             SubMenu {
-                label: "Settings (read-only while tracking)".into(),
+                label: "Settings".into(),
                 enabled: self.editable(),
                 submenu: vec![
                     self.item(
@@ -273,7 +264,6 @@ struct Dialog {
     output: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     input: Option<JoinHandle<std::io::Result<()>>>,
     entry: Option<Entry>,
-    actions: Vec<Action>,
 }
 impl Dialog {
     fn spawn(entry: Option<Entry>, title: &str, text: String) -> Result<Self> {
@@ -282,27 +272,9 @@ impl Dialog {
         if entry.is_some() {
             command.args(["--entry", "--text", title, "--entry-text", &text]);
         } else {
-            command.args(["--text-info", "--height=480"]);
+            command.args(["--text-info", "--font=monospace", "--height=480"]);
         }
         Self::launch(command, entry, text)
-    }
-    fn controls(view: &Tray) -> Result<Self> {
-        let choices = view.control_choices();
-        let mut command = ProcessCommand::new("zenity");
-        command.args([
-            "--list", "--title=Timeclock controls", "--width=720", "--height=600",
-            "--column=ID", "--column=Action", "--hide-column=1", "--print-column=1",
-            "--text",
-            &format!("{}\nProject: {}\nDatabase: {}\n{}\nSelect an action with arrows and Enter. Cancel closes controls, not the tracker. Status refreshes after each action.",
-                view.status.text(), view.settings.project, view.settings.db.display(), view.notice)
-                .replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
-        ]);
-        for (index, (label, _)) in choices.iter().enumerate() {
-            command.arg(index.to_string()).arg(label);
-        }
-        let mut dialog = Self::launch(command, None, String::new())?;
-        dialog.actions = choices.into_iter().map(|(_, action)| action).collect();
-        Ok(dialog)
     }
     fn launch(mut command: ProcessCommand, entry: Option<Entry>, text: String) -> Result<Self> {
         let mut child = command
@@ -329,7 +301,6 @@ impl Dialog {
             output,
             input,
             entry,
-            actions: Vec::new(),
         })
     }
     fn poll(&mut self) -> Result<Option<Option<String>>> {
@@ -378,7 +349,6 @@ struct Controller {
     worker: Option<Worker>,
     spawn_worker: fn(Settings) -> Worker,
     dialog: Option<Dialog>,
-    controls_open: bool,
 }
 impl Controller {
     fn stop(&mut self) -> Result<()> {
@@ -398,18 +368,19 @@ impl Controller {
         );
         self.worker = Some((self.spawn_worker)(self.view.settings.clone()));
         self.view.status = Status::Watching(WatchState::Waiting);
-        self.view.notice.clear();
         Ok(())
     }
     fn projects(&mut self) -> Result<()> {
-        self.view.projects = if self.view.settings.db.try_exists()? {
+        let rows = if self.view.settings.db.try_exists()? {
             store::report_rows(&self.view.settings.db)?
-                .into_iter()
-                .map(|row| row.project)
-                .collect()
         } else {
             Vec::new()
         };
+        self.view.project_seconds = rows
+            .iter()
+            .find(|row| row.project == self.view.settings.project)
+            .map_or(0, |row| row.seconds);
+        self.view.projects = rows.into_iter().map(|row| row.project).collect();
         if !self.view.settings.project.is_empty()
             && !self.view.projects.contains(&self.view.settings.project)
         {
@@ -452,6 +423,7 @@ impl Controller {
         );
         self.stop()?;
         self.view.settings = settings;
+        self.view.project_seconds = 0;
         self.projects()?;
         if !self.view.settings.project.is_empty() {
             self.start_watching()?;
@@ -461,10 +433,6 @@ impl Controller {
     fn action(&mut self, action: Action) -> Result<()> {
         self.poll_worker()?;
         match action {
-            Action::Controls if self.dialog.is_none() => {
-                self.dialog = Some(Dialog::controls(&self.view)?);
-                self.controls_open = true;
-            }
             Action::Select(project) => self.apply(Entry::Project, project)?,
             Action::Entry(entry) if self.dialog.is_none() => {
                 ensure!(
@@ -510,14 +478,19 @@ impl Controller {
         Ok(())
     }
     fn poll_worker(&mut self) -> Result<()> {
+        let mut updated = false;
         if let Some(worker) = &self.worker {
             for state in worker.events.try_iter() {
                 self.view.status = Status::Watching(state);
+                updated = true;
             }
             if worker.thread.is_finished() {
                 self.stop()?;
-                self.projects()?;
+                updated = true;
             }
+        }
+        if updated {
+            self.projects().context("Cannot refresh project time")?;
         }
         Ok(())
     }
@@ -527,29 +500,14 @@ impl Controller {
             let result = dialog.poll();
             if !matches!(result, Ok(None)) {
                 let dialog = self.dialog.take().unwrap();
-                if !dialog.actions.is_empty() {
-                    self.controls_open = false; // Cancel or failure must not reopen a dialog.
+                if let Some(entry) = dialog.entry {
                     if let Some(Some(text)) = result? {
-                        let action = dialog
-                            .actions
-                            .get(text.parse::<usize>()?)
-                            .context("Invalid controls selection")?
-                            .clone();
-                        self.controls_open = true;
-                        if matches!(action, Action::Quit) {
-                            self.controls_open = false;
-                            self.view.tx.send(action)?;
-                        } else {
-                            self.action(action)?;
-                        }
+                        self.apply(entry, text)?;
                     }
-                } else if let (Some(entry), Some(Some(text))) = (dialog.entry, result?) {
-                    self.apply(entry, text)?;
+                } else {
+                    result?;
                 }
             }
-        }
-        if self.controls_open && self.dialog.is_none() {
-            self.dialog = Some(Dialog::controls(&self.view)?);
         }
         Ok(())
     }
@@ -557,9 +515,8 @@ impl Controller {
         let text = format!("{error:#}");
         eprintln!("{text}");
         if self.worker.is_none() {
-            self.view.status = Status::Error(text.clone());
+            self.view.status = Status::Error(text);
         }
-        self.view.notice = text;
     }
 }
 impl Drop for Controller {
@@ -571,7 +528,7 @@ impl Drop for Controller {
     }
 }
 
-pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>, controls: bool) -> Result<()> {
+pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))?;
@@ -585,8 +542,8 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>, controls: bool) ->
             atr,
         },
         projects: Vec::new(),
+        project_seconds: 0,
         status: Status::Idle,
-        notice: "Select or enter a project; the card controls timing.".into(),
         dialog_open: false,
     };
     let mut controller = Controller {
@@ -594,15 +551,11 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>, controls: bool) ->
         worker: None,
         spawn_worker: Worker::watch,
         dialog: None,
-        controls_open: false,
     };
     if let Err(error) = controller.projects() {
         controller.error(error);
     }
     let handle = controller.view.clone().spawn().context("Cannot register system tray; a session bus and StatusNotifier host (such as DMS) are required")?;
-    if controls {
-        controller.view.tx.send(Action::Controls)?;
-    }
     while running.load(Ordering::SeqCst) && !handle.is_closed() {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Action::Quit) => break,
@@ -642,8 +595,8 @@ mod tests {
                     atr: parse_atr(TARGET_ATR).unwrap(),
                 },
                 projects: Vec::new(),
+                project_seconds: 0,
                 status: Status::Idle,
-                notice: String::new(),
                 dialog_open: false,
             },
             worker: None,
@@ -657,8 +610,167 @@ mod tests {
                 })
             },
             dialog: None,
-            controls_open: false,
         }
+    }
+
+    fn status_label(view: &Tray) -> String {
+        let title = ksni::Tray::title(view);
+        assert_eq!(ksni::Tray::tool_tip(view).title, title);
+        match &ksni::Tray::menu(view)[0] {
+            MenuItem::Standard(item) => {
+                assert!(!item.enabled);
+                assert!(item.label.starts_with("Project: "));
+            }
+            _ => panic!("Expected project row first in the menu"),
+        }
+        title
+    }
+
+    #[test]
+    fn left_click_requests_a_report_in_any_tracking_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        let (tx, rx) = mpsc::channel();
+        c.view.tx = tx;
+        for status in [
+            Status::Idle,
+            Status::Watching(WatchState::Waiting),
+            Status::Watching(WatchState::Tracking),
+            Status::Watching(WatchState::CardAbsent),
+        ] {
+            c.view.status = status.clone();
+            ksni::Tray::activate(&mut c.view, 0, 0);
+            assert!(matches!(rx.try_recv().unwrap(), Action::Report));
+            assert!(rx.try_recv().is_err());
+            assert_eq!(c.view.status, status);
+        }
+        assert!(c.worker.is_none());
+        assert!(!c.view.settings.db.exists());
+    }
+
+    #[test]
+    fn menu_routes_only_scan_report_and_quit_top_level_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        let (tx, rx) = mpsc::channel();
+        c.view.tx = tx;
+        assert!(ksni::Tray::menu(&c.view).iter().all(|item| {
+            !matches!(item, MenuItem::Standard(item) if item.label.starts_with("Database:"))
+        }));
+        let actions: Vec<_> = ksni::Tray::menu(&c.view)
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Standard(item) if item.enabled => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Scan readers…", "Report…", "Quit"]
+        );
+        for item in actions {
+            (item.activate)(&mut c.view);
+        }
+        assert!(matches!(rx.try_recv().unwrap(), Action::Scan));
+        assert!(matches!(rx.try_recv().unwrap(), Action::Report));
+        assert!(matches!(rx.try_recv().unwrap(), Action::Quit));
+        assert!(rx.try_recv().is_err());
+        assert!(c.worker.is_none());
+        assert!(!c.view.settings.db.exists());
+    }
+
+    #[test]
+    fn title_time_follows_checkpoints_pause_and_reinsertion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clock.db");
+        let mut c = controller(db.clone());
+        let mut store = store::Store::open(&db).unwrap();
+        let project = c.view.settings.project.clone();
+        store.record("OLD_project <&>", "3B00", "fake", 0).unwrap();
+        store.stop("removed", Some(99999)).unwrap();
+        store.record(&project, "3B00", "fake", 10).unwrap();
+        store.stop("removed", Some(3733)).unwrap();
+        store.record(&project, "3B00", "fake", 10000).unwrap();
+
+        let (updates, events) = mpsc::channel();
+        let (ready, wait) = mpsc::channel();
+        c.worker = Some(Worker::spawn(move |running, tx| {
+            while running.load(Ordering::SeqCst) {
+                if let Ok(state) = events.recv_timeout(Duration::from_millis(5)) {
+                    tx.send(state)?;
+                    ready.send(())?;
+                }
+            }
+            Ok(())
+        }));
+        let update = |c: &mut Controller, state| {
+            updates.send(state).unwrap();
+            wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.poll().unwrap();
+        };
+        update(&mut c, WatchState::Tracking);
+        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:03)");
+        store.record(&project, "3B00", "fake", 10002).unwrap();
+        update(&mut c, WatchState::Tracking);
+        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:05)");
+        store.stop("removed", Some(10003)).unwrap();
+        update(&mut c, WatchState::CardAbsent);
+        for _ in 0..3 {
+            c.poll().unwrap();
+            assert_eq!(status_label(&c.view), "Timeclock: paused (01:02:06)");
+        }
+        store.record(&project, "3B00", "fake", 20000).unwrap();
+        update(&mut c, WatchState::Tracking);
+        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:06)");
+        store.record(&project, "3B00", "fake", 20001).unwrap();
+        update(&mut c, WatchState::Tracking);
+        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:07)");
+    }
+
+    #[test]
+    fn title_time_resets_on_selection_and_idle_does_not_create_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("unused.db");
+        let mut c = controller(db.clone());
+        c.view.settings.project.clear();
+        c.projects().unwrap();
+        assert_eq!(status_label(&c.view), "Timeclock: Select project");
+        assert!(!db.exists());
+        c.apply(Entry::Project, "new".into()).unwrap();
+        assert_eq!(status_label(&c.view), "Timeclock: Waiting for card");
+        c.view.status = Status::Watching(WatchState::Tracking);
+        assert_eq!(status_label(&c.view), "Timeclock: tracking (00:00:00)");
+        assert!(!db.exists());
+        c.stop().unwrap();
+
+        let mut store = store::Store::open(&db).unwrap();
+        store.record("new", "3B00", "fake", 0).unwrap();
+        store.stop("removed", Some(360000)).unwrap();
+        c.projects().unwrap();
+        c.view.status = Status::Watching(WatchState::CardAbsent);
+        assert_eq!(status_label(&c.view), "Timeclock: paused (100:00:00)");
+        c.apply(Entry::Project, "NEW".into()).unwrap();
+        assert_eq!(c.view.project_seconds, 0);
+        c.apply(Entry::Project, "new".into()).unwrap();
+        assert_eq!(c.view.project_seconds, 360000);
+
+        let other_db = dir.path().join("other.db");
+        let mut other = store::Store::open(&other_db).unwrap();
+        other.record("new", "3B00", "fake", 10).unwrap();
+        other.stop("removed", Some(70)).unwrap();
+        c.apply(Entry::Database, other_db.to_str().unwrap().into())
+            .unwrap();
+        assert_eq!(c.view.project_seconds, 60);
+        c.view.status = Status::Watching(WatchState::CardAbsent);
+        assert_eq!(status_label(&c.view), "Timeclock: paused (00:01:00)");
+        let missing = dir.path().join("missing.db");
+        c.apply(Entry::Database, missing.to_str().unwrap().into())
+            .unwrap();
+        assert_eq!(c.view.project_seconds, 0);
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -761,11 +873,6 @@ mod tests {
             assert!(c.action(Action::Entry(entry)).is_err());
             assert!(c.apply(entry, "other".into()).is_err());
         }
-        assert!(
-            c.view.control_choices().iter().all(|(_, action)| {
-                matches!(action, Action::Scan | Action::Report | Action::Quit)
-            })
-        );
         for item in ksni::Tray::menu(&c.view) {
             if let MenuItem::SubMenu(menu) = item {
                 assert!(!menu.enabled);
@@ -790,12 +897,6 @@ mod tests {
         wait.recv_timeout(Duration::from_secs(2)).unwrap();
         c.poll().unwrap();
         assert!(c.view.editable());
-        assert!(
-            c.view
-                .control_choices()
-                .iter()
-                .any(|(_, action)| matches!(action, Action::Select(_)))
-        );
         for item in ksni::Tray::menu(&c.view) {
             if let MenuItem::SubMenu(menu) = item {
                 assert!(menu.enabled);
@@ -868,6 +969,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Zenity and a graphical session; briefly opens report dialogs"]
+    fn report_without_card_or_active_project_opens_and_preserves_history() {
+        for has_history in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("report.db");
+            let mut store = store::Store::open(&db).unwrap();
+            if has_history {
+                store.record("work", "3B00", "fake", 10).unwrap();
+                store.stop("removed_or_changed", Some(15)).unwrap();
+            }
+            drop(store);
+            let before = store::report_text(&store::report_rows(&db).unwrap());
+            let mut c = controller(db.clone());
+            c.view.settings.project.clear();
+
+            let (tx, rx) = mpsc::channel();
+            c.view.tx = tx;
+            ksni::Tray::activate(&mut c.view, 0, 0);
+            c.action(rx.try_recv().unwrap()).unwrap();
+            let dialog_id = c.dialog.as_ref().unwrap().child.id();
+            ksni::Tray::activate(&mut c.view, 0, 0);
+            c.action(rx.try_recv().unwrap()).unwrap();
+            assert_eq!(c.dialog.as_ref().unwrap().child.id(), dialog_id);
+            // Poll the real process so unsupported Zenity options cannot pass as a successful spawn.
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(5));
+                c.poll().unwrap();
+                assert!(c.dialog.is_some(), "Report dialog exited unexpectedly");
+            }
+            assert!(c.worker.is_none());
+            assert!(c.view.settings.project.is_empty());
+            assert_eq!(c.view.status, Status::Idle);
+            drop(c);
+            assert_eq!(
+                store::report_text(&store::report_rows(&db).unwrap()),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn cancelled_dialog_leaves_selection_and_active_worker_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = controller(dir.path().join("unused.db"));
@@ -895,16 +1037,20 @@ mod tests {
     }
 
     #[test]
-    fn controls_cancel_and_quit_route_without_starting_watchers() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = controller(dir.path().join("unused.db"));
-        let (tx, rx) = mpsc::channel();
-        c.view.tx = tx;
-        for (script, cancelled) in [("exit 1", true), ("printf '0\\n'", false)] {
-            let mut dialog = fake_dialog(script);
-            dialog.actions = vec![Action::Quit];
+    fn settings_ok_and_cancel_close_the_dialog() {
+        for accepted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = controller(dir.path().join("unused.db"));
+            c.view.settings.reader = Some("old reader".into());
+            c.start_watching().unwrap();
+            let id = c.worker.as_ref().unwrap().thread.thread().id();
+            let mut dialog = fake_dialog(if accepted {
+                "printf 'new reader  \\n'"
+            } else {
+                "printf 'discarded reader\\n'; exit 1"
+            });
+            dialog.entry = Some(Entry::Reader);
             c.dialog = Some(dialog);
-            c.controls_open = true;
             for _ in 0..200 {
                 c.poll().unwrap();
                 if c.dialog.is_none() {
@@ -913,13 +1059,21 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             assert!(c.dialog.is_none());
-            assert!(!c.controls_open);
-            if cancelled {
-                assert!(rx.try_recv().is_err());
+            assert_eq!(
+                c.view.settings.reader.as_deref(),
+                Some(if accepted {
+                    "new reader  "
+                } else {
+                    "old reader"
+                })
+            );
+            let current_id = c.worker.as_ref().unwrap().thread.thread().id();
+            if accepted {
+                assert_ne!(id, current_id);
             } else {
-                assert!(matches!(rx.try_recv().unwrap(), Action::Quit));
+                assert_eq!(id, current_id);
             }
-            assert!(c.worker.is_none());
+            assert_eq!(c.view.settings.project, "old_project <&>");
             assert!(!c.view.settings.db.exists());
         }
     }
@@ -971,8 +1125,14 @@ mod tests {
         assert!(
             item.get_property::<String>("Title")
                 .unwrap()
-                .contains("Select a project")
+                .contains("Select project")
         );
+        assert!(!item.get_property::<bool>("ItemIsMenu").unwrap());
+        let _: () = item.call("Activate", &(0i32, 0i32)).unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::Report
+        ));
         let icons: Vec<(i32, i32, Vec<u8>)> = item.get_property("IconPixmap").unwrap();
         assert_eq!(icons[0].2.len(), 32 * 32 * 4);
         let menu: zbus::zvariant::OwnedObjectPath = item.get_property("Menu").unwrap();
@@ -996,8 +1156,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("Keyboard controls"));
         for label in [
-            "Keyboard controls",
             "New project",
             "Scan readers",
             "Report",
@@ -1046,7 +1206,7 @@ mod tests {
         assert!(
             item.get_property::<String>("Title")
                 .unwrap()
-                .contains("Tracking")
+                .contains("tracking")
         );
         handle.update(|tray| tray.status = Status::Error("fake error".into()));
         assert!(

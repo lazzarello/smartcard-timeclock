@@ -95,24 +95,9 @@ A session DBus and a running tray host are required. Zenity must be on PATH for
 dialogs (`devenv shell` supplies it). Keep the launching terminal open, or launch
 the built binary from your desktop launcher with an explicit absolute `--db`.
 
-**Keyboard access:** installed DMS 1.6.3 menus are mouse-oriented, not keyboard
-navigable. Choose **Keyboard controls…** in the tray to open a Zenity action list,
-or launch it directly without using the host menu:
-
-```sh
-cargo run -- --db /absolute/path/to/work.sqlite3 tray --controls
-```
-
-Use arrows/Tab and Enter for actions, including project selection/entry, scan,
-reports, settings and Quit. Project/settings actions are unavailable while tracking. The controls reopen after each action
-or entry/report dialog; Cancel on the action list closes only controls, not tracking.
-The action list shows a status snapshot refreshed when reopened (not a live timer);
-the tray keeps updating. Errors appear on the next action list. No DMS keybindings
-or configuration are changed. Screen-reader and visible keyboard behavior still
-require manual acceptance.
-
-**Launch is idle and does not create or recover a database.** Click the clock
-icon to open the menu (right-click also works). Choose an existing project under
+**Launch is idle and does not create or recover a database.** A single left-click
+on the clock icon opens the report; a single right-click opens the full menu.
+Choose an existing project under
 **Projects**, or **New project…** to enter a name. Selection automatically starts
 watching: insertion starts timing and removal stops timing. If the target card is
 already inserted, timing starts immediately. There are no manual Play/Pause or
@@ -120,12 +105,16 @@ Start/Stop timer controls. Names are exact and case-sensitive. Projects come fro
 history plus the currently selected name. Unrecorded names disappear when you select
 another name; they are not a saved project registry.
 
-The menu and tooltip show **Tracking**, **Waiting for target card**,
-**Paused — card absent** (reinsertion resumes), **Select a project**, or **Error**.
-The icon is a status indicator, not a button: green clock hands mean tracking,
+The tray menu header and tooltip show **Timeclock: tracking (HH:MM:SS)** or
+**Timeclock: paused (HH:MM:SS)** after card removal (reinsertion resumes).
+Time is the selected project's cumulative total through the last recorded checkpoint,
+excluding pauses. No time is shown without an active project or while waiting for
+its first insertion. Waiting, idle, and error explanations appear in the header
+and tooltip; there is no duplicate status row in the menu.
+The icon also indicates status: green clock hands mean tracking,
 an orange dot means waiting for the card, a grey clock means no project is armed,
-and a red cross means error. The menu always shows the selected project and
-absolute database path.
+and a red cross means error. The menu always shows the selected project.
+The current database path is shown when opening **Settings → Database path…**.
 
 **Project selection and settings become read-only while tracking.** Remove the
 target card to unlock them; selecting another project while absent automatically
@@ -137,7 +126,8 @@ the project to retry. Only one watcher runs at a time.
 **Scan readers…** shows exact reader names and ATRs without opening SQLite.
 **Report…** shows the same totals as the CLI in a selectable text dialog.
 **Settings** provides database path, exact reader name (empty = automatic), and
-ATR entry. Cancel leaves settings and tracking unchanged; invalid entries are
+ATR entry. OK applies the change and closes the dialog.
+Cancel closes it without changing settings or tracking; invalid entries are
 rejected. Settings are editable only when not tracking. Accepting a valid change
 joins the previous watcher and automatically rearms the selected project; without
 a selected project, the tray stays idle. The watcher reuses the CLI's PC/SC,
@@ -159,19 +149,20 @@ lock identity.
 
 ```sh
 test_dir=$(mktemp -d)
-cargo run -- --db "$test_dir/acceptance.sqlite3" tray --controls
+cargo run -- --db "$test_dir/acceptance.sqlite3" tray
 # After quitting, inspect if desired, then remove only this test directory:
 rm -r -- "$test_dir"
 ```
 
-1. Confirm a visible clock icon in DMS; open the menu and verify the displayed
-   absolute path. Verify the Keyboard controls action list with arrows/Tab/Enter,
-   all controls and Zenity text entry/cancellation; do not expect keyboard
-   navigation in DMS’s own menu. Check screen-reader labels/focus manually.
+1. Confirm a visible clock icon in DMS. Right-click to open the full menu; open
+   **Settings → Database path…** and verify the current absolute path.
+   Verify the menu actions and Zenity text entry/cancellation. After recording a
+   session, left-click to open the report; repeated clicks must not open duplicate dialogs.
+   Check screen-reader labels/focus manually.
 2. Use Scan readers; set the exact reader and target ATR. Enter/select a project
    (also try underscores, spaces and Unicode). It must start watching automatically.
 3. Select with no card: Waiting. Insert the target: Tracking. Project selection and
-   settings must become read-only in both the tray and keyboard controls. Remove:
+   settings must become read-only in the tray menu. Remove:
    card-absent pause; selection becomes editable. Wait, reinsert, remove and check
    Report: absent time must be excluded; reinsertion adds another session. A
    different-ATR card is ignored. There must be no manual timer controls.
@@ -220,6 +211,9 @@ by Git. For a simple backup, stop the watcher before copying the database, or us
 SQLite's backup command while it is running.
 
 Reports show hours/minutes/seconds, session counts, and unclosed-session counts.
+`SESSIONS` increases once per target-card insertion for that project, including a
+currently open session; removal closes it without resetting the count. `OPEN` is
+normally zero after removal and one while tracking.
 An open session contributes time only through its last persisted checkpoint;
 `OPEN` does not prove a watcher is still alive. Inspect individual sessions with:
 
@@ -236,6 +230,8 @@ sqlite3 timeclock.sqlite3 \
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+# Real Zenity regression test (graphical session; briefly opens report dialogs):
+cargo test report_without_card_or_active_project -- --ignored
 # Isolated protocol test (never put its fake watcher on the desktop bus):
 TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- cargo test isolated_protocol -- --ignored
 ```

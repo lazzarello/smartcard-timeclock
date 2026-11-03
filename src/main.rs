@@ -53,9 +53,6 @@ enum Command {
     Report,
     /// Show a hardware-controlled system tray (select a project, then insert/remove the card)
     Tray {
-        /// Open keyboard-accessible controls immediately
-        #[arg(long)]
-        controls: bool,
         /// Exact PC/SC reader name; empty in the tray settings restores automatic selection
         #[arg(long)]
         reader: Option<String>,
@@ -297,13 +294,9 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))?;
             watch(&cli.db, &project, reader.as_deref(), &atr, &running, |_| {})
         }
-        Command::Tray {
-            reader,
-            atr,
-            controls,
-        } => {
+        Command::Tray { reader, atr } => {
             let atr = parse_atr(&atr).map_err(anyhow::Error::msg)?;
-            tray::run(cli.db, reader, atr, controls)
+            tray::run(cli.db, reader, atr)
         }
         Command::Report => {
             store::report(&cli.db).context("Cannot read report; run watch first or check --db")
@@ -402,9 +395,10 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_controls_are_available_at_tray_launch() {
-        let cli = Cli::try_parse_from(["timeclock", "tray", "--controls"]).unwrap();
-        assert!(matches!(cli.command, Command::Tray { controls: true, .. }));
+    fn tray_launch_does_not_offer_keyboard_controls() {
+        let cli = Cli::try_parse_from(["timeclock", "tray"]).unwrap();
+        assert!(matches!(cli.command, Command::Tray { .. }));
+        assert!(Cli::try_parse_from(["timeclock", "tray", "--controls"]).is_err());
     }
 
     #[test]
