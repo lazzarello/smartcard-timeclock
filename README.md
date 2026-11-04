@@ -90,8 +90,8 @@ DBusMenu tray host (such as DMS / DankMaterialShell):
 
 Right-click for **Projects → New project…** or an existing project, then use the
 card to start/pause timing. Left-click opens a compact, read-only live status
-window, for example `tracking My Project (01:58:00)`. Removing the card changes it
-to `paused My Project (01:58:01)`; the cumulative time stays fixed until reinsertion.
+window, for example `Tracking My Project (01:58:00)`. Removing the card changes it
+to `Paused My Project (01:58:01)`; the cumulative time stays fixed until reinsertion.
 The floating window follows the desktop's light/dark preference, including changes
 while open, via the desktop settings portal. If that preference is unavailable,
 it keeps the configured GTK theme. Its compact title bar matches Alacritty's

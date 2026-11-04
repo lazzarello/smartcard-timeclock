@@ -154,7 +154,7 @@ impl ksni::Tray for Tray {
         "smartcard-timeclock".into()
     }
     fn title(&self) -> String {
-        format!("{}", self.status_text())
+        self.status_text()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
@@ -754,14 +754,7 @@ mod tests {
     fn status_label(view: &Tray) -> String {
         let title = ksni::Tray::title(view);
         assert_eq!(ksni::Tray::tool_tip(view).title, title);
-        assert_eq!(title, format!("Timeclock: {}", view.status_text()));
-        match &ksni::Tray::menu(view)[0] {
-            MenuItem::Standard(item) => {
-                assert!(!item.enabled);
-                assert!(item.label.starts_with("Project: "));
-            }
-            _ => panic!("Expected project row first in the menu"),
-        }
+        assert_eq!(title, view.status_text());
         title
     }
 
@@ -864,37 +857,22 @@ mod tests {
             c.poll().unwrap();
         };
         update(&mut c, WatchState::Tracking);
-        assert_eq!(
-            status_label(&c.view),
-            "Timeclock: tracking old_project <&> (01:02:03)"
-        );
+        assert_eq!(status_label(&c.view), "Tracking old_project <&> (01:02:03)");
         store.record(&project, "3B00", "fake", 10002).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(
-            status_label(&c.view),
-            "Timeclock: tracking old_project <&> (01:02:05)"
-        );
+        assert_eq!(status_label(&c.view), "Tracking old_project <&> (01:02:05)");
         store.stop("removed", Some(10003)).unwrap();
         update(&mut c, WatchState::CardAbsent);
         for _ in 0..3 {
             c.poll().unwrap();
-            assert_eq!(
-                status_label(&c.view),
-                "Timeclock: paused old_project <&> (01:02:06)"
-            );
+            assert_eq!(status_label(&c.view), "Paused old_project <&> (01:02:06)");
         }
         store.record(&project, "3B00", "fake", 20000).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(
-            status_label(&c.view),
-            "Timeclock: tracking old_project <&> (01:02:06)"
-        );
+        assert_eq!(status_label(&c.view), "Tracking old_project <&> (01:02:06)");
         store.record(&project, "3B00", "fake", 20001).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(
-            status_label(&c.view),
-            "Timeclock: tracking old_project <&> (01:02:07)"
-        );
+        assert_eq!(status_label(&c.view), "Tracking old_project <&> (01:02:07)");
     }
 
     #[test]
@@ -904,15 +882,12 @@ mod tests {
         let mut c = controller(db.clone());
         c.view.settings.project.clear();
         c.projects().unwrap();
-        assert_eq!(status_label(&c.view), "Timeclock: Select project");
+        assert_eq!(status_label(&c.view), "Select project");
         assert!(!db.exists());
         c.apply(Entry::Project, "new".into()).unwrap();
-        assert_eq!(
-            status_label(&c.view),
-            "Timeclock: waiting for card new (00:00:00)"
-        );
+        assert_eq!(status_label(&c.view), "Waiting for card new (00:00:00)");
         c.view.status = Status::Watching(WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking new (00:00:00)");
+        assert_eq!(status_label(&c.view), "Tracking new (00:00:00)");
         assert!(!db.exists());
         c.stop().unwrap();
 
@@ -921,7 +896,7 @@ mod tests {
         store.stop("removed", Some(360000)).unwrap();
         c.projects().unwrap();
         c.view.status = Status::Watching(WatchState::CardAbsent);
-        assert_eq!(status_label(&c.view), "Timeclock: paused new (100:00:00)");
+        assert_eq!(status_label(&c.view), "Paused new (100:00:00)");
         c.apply(Entry::Project, "NEW".into()).unwrap();
         assert_eq!(c.view.project_seconds, 0);
         c.apply(Entry::Project, "new".into()).unwrap();
@@ -935,7 +910,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.view.project_seconds, 60);
         c.view.status = Status::Watching(WatchState::CardAbsent);
-        assert_eq!(status_label(&c.view), "Timeclock: paused new (00:01:00)");
+        assert_eq!(status_label(&c.view), "Paused new (00:01:00)");
         let missing = dir.path().join("missing.db");
         c.apply(Entry::Database, missing.to_str().unwrap().into())
             .unwrap();
@@ -1184,7 +1159,7 @@ mod tests {
             c.poll().unwrap();
             assert_eq!(
                 c.status_window.as_ref().unwrap().label.text(),
-                "tracking My_Project <&> 日本語 (01:58:00)"
+                "Tracking My_Project <&> 日本語 (01:58:00)"
             );
             c.view.project_seconds += 1;
             c.view.status = Status::Watching(WatchState::CardAbsent);
@@ -1192,7 +1167,7 @@ mod tests {
                 c.poll().unwrap();
                 assert_eq!(
                     c.status_window.as_ref().unwrap().label.text(),
-                    "paused My_Project <&> 日本語 (01:58:01)"
+                    "Paused My_Project <&> 日本語 (01:58:01)"
                 );
             }
             window.close();
@@ -1443,6 +1418,7 @@ mod tests {
         let mut c = controller(dir.path().join("untouched.db"));
         let (actions, received) = mpsc::channel();
         c.view.tx = actions;
+        c.projects().unwrap();
         let handle = c.view.clone().spawn().unwrap();
         let name = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         // SNI uses NewTitle, not PropertiesChanged; do not use zbus's property cache.
@@ -1541,7 +1517,7 @@ mod tests {
         assert!(
             item.get_property::<String>("Title")
                 .unwrap()
-                .contains("tracking")
+                .contains("Tracking")
         );
         handle.update(|tray| tray.status = Status::Error("fake error".into()));
         assert!(

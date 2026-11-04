@@ -195,7 +195,7 @@ event queue so stale events cannot affect the new selection.
 
 Left-click opens/reuses a compact read-only GTK4 status window; right-click opens
 the unchanged action menu, including Report. The status line is, for example,
-`tracking My Project (01:58:00)` or `paused My Project (01:58:01)`. It updates while
+`Tracking My Project (01:58:00)` or `Paused My Project (01:58:01)`. It updates while
 open, freezes during pauses, and shows selection/waiting/error states honestly.
 Closing the window does not stop the watcher. The native GTK header bar uses
 widget-local sizing CSS for a 35-logical-pixel minimum height (including its bottom
@@ -255,8 +255,8 @@ rm -r -- "$test_dir"
 2. Scan readers; set the exact reader and ATR. Enter/select projects with spaces,
    underscores, and Unicode. Selection must automatically arm the watcher.
 3. Keep the status window open. Without a card: waiting for card, project, and
-   total. Insert: `tracking My Project (HH:MM:SS)`, with cumulative time updating and
-   project/settings controls locked. Remove: `paused My Project (HH:MM:SS)`, time
+   total. Insert: `Tracking My Project (HH:MM:SS)`, with cumulative time updating and
+   project/settings controls locked. Remove: `Paused My Project (HH:MM:SS)`, time
    fixed and controls editable. Reinsert: time resumes without counting absence. No manual timer
    controls should appear; a different-ATR card must not track.
 4. Open project entry while absent, insert the card, then submit: the active
