@@ -6,8 +6,10 @@ Agent-specific instructions live in [AGENTS.md](AGENTS.md).
 ## Setup
 
 Use Rust **1.89+**, Cargo, rustfmt, Clippy, pkg-config, and the PC/SC and SQLite
-headers/libraries. The CLI needs no GUI. Tray dialogs additionally need Zenity and
-a graphical session with a session DBus and StatusNotifierItem/DBusMenu host.
+headers/libraries, plus GTK4 development libraries for the tray status window.
+The CLI needs no display (GTK is initialized only when opening the status window).
+Tray dialogs additionally need Zenity and a graphical session with a session DBus
+and StatusNotifierItem/DBusMenu host.
 
 The existing Nix environment supplies Rust and the native/development tools:
 
@@ -23,7 +25,7 @@ shell. Confirm hardware independently with `pcsc_scan`.
 For Debian/Ubuntu:
 
 ```sh
-sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev \
+sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev libgtk-4-dev \
   pcscd libccid pcsc-tools dbus dbus-bin sqlite3 zenity
 sudo systemctl enable --now pcscd.socket
 rustup component add rustfmt clippy
@@ -58,17 +60,30 @@ cargo build --locked --release --bin smartcard-timeclock
 The normal tests require no physical reader or desktop. They cover ATR parsing,
 reader selection, matching, session persistence/recovery, clock rollback, write
 contention, locking, reports, tray state, settings, and dialog lifecycle using
-fake observations and temporary databases. Two tests are ignored by default:
+fake observations and temporary databases. Three tests are ignored by default:
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
   real SNI/DBusMenu protocols. **Never run it on the desktop session bus.** The
   command above provides an isolated bus and requires `dbus-run-session`,
   `dbus-send`, and `timeout`.
-- `report_without_card_or_active_project…` opens real Zenity report dialogs. Run
-  it separately in a graphical session:
+- `status_and_report_without_card_or_active_project…` opens a real GTK4 status
+  window and Zenity report dialogs. It checks live text, literal project names,
+  singleton/reopen behavior, and unchanged report history. Run it separately in a
+  graphical session:
 
   ```sh
-  cargo test --locked report_without_card_or_active_project -- --ignored
+  cargo test --locked status_and_report_without_card_or_active_project -- --ignored
+  ```
+
+- `isolated_theme…` registers a fake desktop settings portal and checks initial
+  dark mode, live light/dark/no-preference changes, unrelated signals, and cleanup.
+  It also checks the 35-logical-pixel title bar in both modes, native title buttons,
+  and expansion for larger fonts.
+  It needs a graphical session (or a private headless compositor) **and an isolated
+  bus**; never register the fake portal on the desktop bus:
+
+  ```sh
+  TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- cargo test --locked isolated_theme -- --ignored
   ```
 
 Do not use a blanket `cargo test -- --ignored` on the desktop bus.
@@ -178,11 +193,24 @@ blocking validation and before changing settings. Validate before mutation; Canc
 must change nothing. Join the previous watcher before switching and discard its
 event queue so stale events cannot affect the new selection.
 
-Left-click opens a single report dialog; right-click opens the menu. Reports and
-reader scanning remain available while tracking. The selected project's total
-includes all persisted sessions/checkpoints and excludes pauses; titles and
-tooltips reflect the same status/time. Errors must be actionable, never shown as
-successful tracking. After fixing a watcher error, reselecting the project retries.
+Left-click opens/reuses a compact read-only GTK4 status window; right-click opens
+the unchanged action menu, including Report. The status line is, for example,
+`tracking My Project (01:58:00)` or `paused My Project (01:58:01)`. It updates while
+open, freezes during pauses, and shows selection/waiting/error states honestly.
+Closing the window does not stop the watcher. The native GTK header bar uses
+widget-local sizing CSS for a 35-logical-pixel minimum height (including its bottom
+border), matching Alacritty's Wayland decoration. It retains themed colors, native
+window controls/dragging, display scaling, and room to expand for larger fonts.
+Its light/dark appearance follows
+`org.freedesktop.portal.Settings`'s `org.freedesktop.appearance/color-scheme`, read
+asynchronously and monitored via `SettingChanged`. No preference or an unavailable
+portal preserves the configured GTK theme; no shell settings are changed. The
+subscription and pending read are cancelled when the window is destroyed. GTK
+events are serviced by the tray controller; there is no separate timer. Reports and reader scanning remain
+available while tracking. The selected project's total includes all persisted
+sessions/checkpoints and excludes pauses; titles and tooltips reflect the same
+project/status/time. Errors must be actionable, never shown as successful tracking.
+After fixing a watcher error, reselecting the project retries.
 
 Every Zenity child and pipe thread is owned and reaped on completion, Quit,
 Ctrl-C, or SIGTERM. Closing a report early may break its input pipe without making
@@ -214,13 +242,22 @@ rm -r -- "$test_dir"
 
 1. Confirm a visible clock icon in DMS (or the intended host). Right-click for
    the full menu; **Settings → Database path…** shows the absolute path. Verify
-   Zenity entry/cancellation and screen-reader labels/focus. After recording a
-   session, left-click opens the report; repeated clicks must not duplicate it.
+   Zenity entry/cancellation and screen-reader labels/focus. Left-click opens a
+   compact read-only status window, even before recording a session; repeated
+   clicks must reuse it. Verify keyboard focus, text selection/screen-reader
+   output, closing, and reopening without changing tracking. Toggle the desktop's
+   light/dark preference with the window open and hidden: reopening must match the
+   current mode, with readable text and decorations. Compare the title-bar height
+   against Alacritty at the same display scale; verify dragging, the close button,
+   and unclipped text at larger accessibility font sizes. No toolbar clock should appear.
+   Open **Report…**
+   from the right-click menu; repeated requests must not duplicate that dialog.
 2. Scan readers; set the exact reader and ATR. Enter/select projects with spaces,
    underscores, and Unicode. Selection must automatically arm the watcher.
-3. Without a card: Waiting. Insert: Tracking, with cumulative time updating and
-   project/settings controls locked. Remove: Paused, time fixed and controls
-   editable. Reinsert: time resumes without counting absence. No manual timer
+3. Keep the status window open. Without a card: waiting for card, project, and
+   total. Insert: `tracking My Project (HH:MM:SS)`, with cumulative time updating and
+   project/settings controls locked. Remove: `paused My Project (HH:MM:SS)`, time
+   fixed and controls editable. Reinsert: time resumes without counting absence. No manual timer
    controls should appear; a different-ATR card must not track.
 4. Open project entry while absent, insert the card, then submit: the active
    project must not change. Remove and select another project; insertion must

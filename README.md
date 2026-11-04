@@ -19,7 +19,7 @@ compatible newer systems, not a static or cross-platform binary. Install the hos
 libraries and reader support first. For Debian/Ubuntu:
 
 ```sh
-sudo apt-get install libpcsclite1 libsqlite3-0 pcscd libccid pcsc-tools
+sudo apt-get install libpcsclite1 libsqlite3-0 libgtk-4-1 pcscd libccid pcsc-tools
 sudo systemctl enable --now pcscd.socket
 # Optional, for tray dialogs:
 sudo apt-get install zenity
@@ -35,7 +35,7 @@ Download the source with **Code → Download ZIP**, or clone this repository. In
 Rust **1.89 or newer** with Cargo. On Debian/Ubuntu, also install:
 
 ```sh
-sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev
+sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev libgtk-4-dev
 ```
 
 From the source directory:
@@ -89,9 +89,17 @@ DBusMenu tray host (such as DMS / DankMaterialShell):
 ```
 
 Right-click for **Projects → New project…** or an existing project, then use the
-card to start/pause timing. Left-click opens the report. The title/tooltip shows
-tracking or paused time; green means tracking, orange waiting/paused, grey idle,
-and red error. Remove the card before changing projects or settings.
+card to start/pause timing. Left-click opens a compact, read-only live status
+window, for example `tracking My Project (01:58:00)`. Removing the card changes it
+to `paused My Project (01:58:01)`; the cumulative time stays fixed until reinsertion.
+The floating window follows the desktop's light/dark preference, including changes
+while open, via the desktop settings portal. If that preference is unavailable,
+it keeps the configured GTK theme. Its compact title bar matches Alacritty's
+35-logical-pixel Wayland title bar, growing if larger fonts need more space.
+Repeated clicks reuse the window; closing it does not stop tracking. Reports remain
+available via **Report…** in the right-click menu. The title/tooltip shows the same
+project, status, and checkpointed time; green means tracking, orange waiting/paused,
+grey idle, and red error. Remove the card before changing projects or settings.
 
 **Settings** changes the database, reader, or ATR. Choices last only for this run;
 repeat launch options to reuse them. The tray also accepts `--reader` and `--atr`.

@@ -17,7 +17,7 @@ jobs:
       - name: Install native dependencies and evaluation tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends pkg-config libpcsclite-dev libsqlite3-dev dbus dbus-bin
+          apt-get install -y --no-install-recommends pkg-config libpcsclite-dev libsqlite3-dev libgtk-4-dev dbus dbus-bin
           rustup component add rustfmt clippy
       - name: Check formatting
         run: cargo fmt --all -- --check

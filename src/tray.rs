@@ -115,9 +115,9 @@ impl Tray {
     fn status_text(&self) -> String {
         if !self.settings.project.is_empty() {
             let state = match self.status {
-                Status::Watching(WatchState::Waiting) => Some("waiting for card"),
-                Status::Watching(WatchState::Tracking) => Some("tracking"),
-                Status::Watching(WatchState::CardAbsent) => Some("paused"),
+                Status::Watching(WatchState::Waiting) => Some("Waiting for card"),
+                Status::Watching(WatchState::Tracking) => Some("Tracking"),
+                Status::Watching(WatchState::CardAbsent) => Some("Paused"),
                 _ => None,
             };
             if let Some(state) = state {
@@ -140,14 +140,6 @@ impl Tray {
             activate: Box::new(move |tray: &mut Self| {
                 let _ = tray.tx.send(action.clone());
             }),
-            ..Default::default()
-        }
-        .into()
-    }
-    fn info(text: &str) -> MenuItem<Self> {
-        StandardItem {
-            label: label(text),
-            enabled: false,
             ..Default::default()
         }
         .into()
@@ -215,14 +207,6 @@ impl ksni::Tray for Tray {
             self.editable() && !self.dialog_open,
         ));
         vec![
-            Self::info(&format!(
-                "Project: {}",
-                if self.settings.project.is_empty() {
-                    "(select one)"
-                } else {
-                    &self.settings.project
-                }
-            )),
             SubMenu {
                 label: "Projects".into(),
                 enabled: self.editable(),
