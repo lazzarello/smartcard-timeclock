@@ -1,13 +1,16 @@
 //! Standard SNI/DBusMenu adapter; the only tracker is `watch` in main.rs.
 use super::*;
+use gtk4::{gio, glib, prelude::*};
 use ksni::{
     MenuItem,
     blocking::TrayMethods,
     menu::{StandardItem, SubMenu},
 };
 use std::{
+    cell::Cell,
     io::{Read, Write},
     process::{Child, Command as ProcessCommand, Stdio},
+    rc::Rc,
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
 };
@@ -91,6 +94,7 @@ enum Action {
     Select(String),
     Entry(Entry),
     Scan,
+    Status,
     Report,
     Quit,
 }
@@ -108,21 +112,23 @@ fn label(text: &str) -> String {
     text.replace('_', "__")
 }
 impl Tray {
-    fn status_title(&self) -> String {
+    fn status_text(&self) -> String {
         if !self.settings.project.is_empty() {
             let state = match self.status {
+                Status::Watching(WatchState::Waiting) => Some("waiting for card"),
                 Status::Watching(WatchState::Tracking) => Some("tracking"),
                 Status::Watching(WatchState::CardAbsent) => Some("paused"),
                 _ => None,
             };
             if let Some(state) = state {
                 return format!(
-                    "Timeclock: {state} ({})",
+                    "{state} {} ({})",
+                    self.settings.project,
                     store::format_duration(self.project_seconds)
                 );
             }
         }
-        format!("Timeclock: {}", self.status.text())
+        self.status.text()
     }
     fn editable(&self) -> bool {
         self.status != Status::Watching(WatchState::Tracking)
@@ -150,13 +156,13 @@ impl Tray {
 impl ksni::Tray for Tray {
     const MENU_ON_ACTIVATE: bool = false;
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.tx.send(Action::Report);
+        let _ = self.tx.send(Action::Status);
     }
     fn id(&self) -> String {
         "smartcard-timeclock".into()
     }
     fn title(&self) -> String {
-        self.status_title()
+        format!("{}", self.status_text())
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
@@ -344,11 +350,141 @@ impl Drop for Dialog {
     }
 }
 
+const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
+const COLOR_SCHEME_KEY: &str = "color-scheme";
+
+fn prefer_dark(mut value: glib::Variant, fallback: bool) -> bool {
+    // Older portals wrap Settings.Read's value in an extra variant.
+    while value.is::<glib::Variant>() {
+        value = value.as_variant().unwrap();
+    }
+    match value.get::<u32>() {
+        Some(1) => true,
+        Some(2) => false,
+        _ => fallback,
+    }
+}
+
+async fn follow_system_theme() {
+    let Some(settings) = gtk4::Settings::default() else {
+        return;
+    };
+    let fallback = settings.is_gtk_application_prefer_dark_theme();
+    let connection = match gio::bus_get_future(gio::BusType::Session).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            eprintln!("Cannot follow desktop color scheme; keeping GTK theme: {error}");
+            return;
+        }
+    };
+    let changed = Rc::new(Cell::new(false));
+    let signal_changed = changed.clone();
+    let signal_settings = settings.clone();
+    let _subscription = connection.subscribe_to_signal(
+        Some("org.freedesktop.portal.Desktop"),
+        Some("org.freedesktop.portal.Settings"),
+        Some("SettingChanged"),
+        Some("/org/freedesktop/portal/desktop"),
+        Some(APPEARANCE_NAMESPACE),
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            if signal.parameters.is::<(String, String, glib::Variant)>()
+                && let Some((namespace, key, value)) =
+                    signal.parameters.get::<(String, String, glib::Variant)>()
+                && namespace == APPEARANCE_NAMESPACE
+                && key == COLOR_SCHEME_KEY
+            {
+                signal_changed.set(true);
+                signal_settings.set_gtk_application_prefer_dark_theme(prefer_dark(value, fallback));
+            }
+        },
+    );
+    match connection
+        .call_future(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "Read",
+            Some(&(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            3000,
+        )
+        .await
+    {
+        Ok(reply) => {
+            // A newer SettingChanged signal must win over an in-flight initial read.
+            if !changed.get()
+                && reply.is::<(glib::Variant,)>()
+                && let Some((value,)) = reply.get::<(glib::Variant,)>()
+            {
+                settings.set_gtk_application_prefer_dark_theme(prefer_dark(value, fallback));
+            }
+        }
+        Err(error) => eprintln!("Cannot read desktop color scheme; keeping GTK theme: {error}"),
+    }
+    // Keep the subscription alive until the status window's task is aborted.
+    std::future::pending::<()>().await;
+}
+
+struct StatusWindow {
+    window: gtk4::Window,
+    label: gtk4::Label,
+    theme: glib::JoinHandle<()>,
+}
+impl StatusWindow {
+    fn new(view: &Tray) -> Result<Self> {
+        gtk4::init().context("Cannot open status window; run in a graphical session")?;
+        let label = gtk4::Label::builder()
+            .label(view.status_text())
+            .selectable(true)
+            .margin_top(16)
+            .margin_bottom(16)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        let titlebar = gtk4::HeaderBar::new();
+        titlebar.add_css_class("default-decoration");
+        let style = gtk4::CssProvider::new();
+        // Alacritty's Wayland title bar is 35 logical pixels, including the bottom border.
+        style.load_from_data("headerbar { min-height: 34px; padding-top: 0; padding-bottom: 0; }");
+        titlebar
+            .style_context()
+            .add_provider(&style, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let window = gtk4::Window::builder()
+            .title("Timeclock status")
+            .resizable(false)
+            .hide_on_close(true)
+            .child(&label)
+            .build();
+        window.set_titlebar(Some(&titlebar));
+        let theme = glib::spawn_future_local(follow_system_theme());
+        Ok(Self {
+            window,
+            label,
+            theme,
+        })
+    }
+    fn update(&self, view: &Tray) {
+        let text = view.status_text();
+        if self.label.text() != text {
+            self.label.set_text(&text);
+        }
+    }
+}
+impl Drop for StatusWindow {
+    fn drop(&mut self) {
+        self.theme.abort();
+        self.window.destroy();
+    }
+}
+
 struct Controller {
     view: Tray,
     worker: Option<Worker>,
     spawn_worker: fn(Settings) -> Worker,
     dialog: Option<Dialog>,
+    status_window: Option<StatusWindow>,
 }
 impl Controller {
     fn stop(&mut self) -> Result<()> {
@@ -434,6 +570,14 @@ impl Controller {
         self.poll_worker()?;
         match action {
             Action::Select(project) => self.apply(Entry::Project, project)?,
+            Action::Status => {
+                if self.status_window.is_none() {
+                    self.status_window = Some(StatusWindow::new(&self.view)?);
+                }
+                let status = self.status_window.as_ref().unwrap();
+                status.update(&self.view);
+                status.window.present();
+            }
             Action::Entry(entry) if self.dialog.is_none() => {
                 ensure!(
                     self.view.editable(),
@@ -496,6 +640,13 @@ impl Controller {
     }
     fn poll(&mut self) -> Result<()> {
         self.poll_worker()?;
+        if let Some(status) = &self.status_window {
+            status.update(&self.view);
+            let context = gtk4::glib::MainContext::default();
+            while context.pending() {
+                context.iteration(false);
+            }
+        }
         if let Some(dialog) = &mut self.dialog {
             let result = dialog.poll();
             if !matches!(result, Ok(None)) {
@@ -521,6 +672,7 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
+        self.status_window.take();
         self.dialog.take();
         if let Err(error) = self.stop() {
             eprintln!("Cannot stop watcher cleanly: {error:#}");
@@ -551,6 +703,7 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
         worker: None,
         spawn_worker: Worker::watch,
         dialog: None,
+        status_window: None,
     };
     if let Err(error) = controller.projects() {
         controller.error(error);
@@ -610,12 +763,14 @@ mod tests {
                 })
             },
             dialog: None,
+            status_window: None,
         }
     }
 
     fn status_label(view: &Tray) -> String {
         let title = ksni::Tray::title(view);
         assert_eq!(ksni::Tray::tool_tip(view).title, title);
+        assert_eq!(title, format!("Timeclock: {}", view.status_text()));
         match &ksni::Tray::menu(view)[0] {
             MenuItem::Standard(item) => {
                 assert!(!item.enabled);
@@ -627,7 +782,19 @@ mod tests {
     }
 
     #[test]
-    fn left_click_requests_a_report_in_any_tracking_state() {
+    fn desktop_color_scheme_handles_preferences_and_wrapped_read_values() {
+        for fallback in [false, true] {
+            for (scheme, expected) in [(0u32, fallback), (1, true), (2, false), (99, fallback)] {
+                let value = scheme.to_variant();
+                assert_eq!(prefer_dark(value.clone(), fallback), expected);
+                assert_eq!(prefer_dark(value.to_variant(), fallback), expected);
+            }
+            assert_eq!(prefer_dark("invalid".to_variant(), fallback), fallback);
+        }
+    }
+
+    #[test]
+    fn left_click_requests_status_in_any_tracking_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = controller(dir.path().join("unused.db"));
         let (tx, rx) = mpsc::channel();
@@ -637,10 +804,11 @@ mod tests {
             Status::Watching(WatchState::Waiting),
             Status::Watching(WatchState::Tracking),
             Status::Watching(WatchState::CardAbsent),
+            Status::Error("Reader unavailable".into()),
         ] {
             c.view.status = status.clone();
             ksni::Tray::activate(&mut c.view, 0, 0);
-            assert!(matches!(rx.try_recv().unwrap(), Action::Report));
+            assert!(matches!(rx.try_recv().unwrap(), Action::Status));
             assert!(rx.try_recv().is_err());
             assert_eq!(c.view.status, status);
         }
@@ -712,22 +880,37 @@ mod tests {
             c.poll().unwrap();
         };
         update(&mut c, WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:03)");
+        assert_eq!(
+            status_label(&c.view),
+            "Timeclock: tracking old_project <&> (01:02:03)"
+        );
         store.record(&project, "3B00", "fake", 10002).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:05)");
+        assert_eq!(
+            status_label(&c.view),
+            "Timeclock: tracking old_project <&> (01:02:05)"
+        );
         store.stop("removed", Some(10003)).unwrap();
         update(&mut c, WatchState::CardAbsent);
         for _ in 0..3 {
             c.poll().unwrap();
-            assert_eq!(status_label(&c.view), "Timeclock: paused (01:02:06)");
+            assert_eq!(
+                status_label(&c.view),
+                "Timeclock: paused old_project <&> (01:02:06)"
+            );
         }
         store.record(&project, "3B00", "fake", 20000).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:06)");
+        assert_eq!(
+            status_label(&c.view),
+            "Timeclock: tracking old_project <&> (01:02:06)"
+        );
         store.record(&project, "3B00", "fake", 20001).unwrap();
         update(&mut c, WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking (01:02:07)");
+        assert_eq!(
+            status_label(&c.view),
+            "Timeclock: tracking old_project <&> (01:02:07)"
+        );
     }
 
     #[test]
@@ -740,9 +923,12 @@ mod tests {
         assert_eq!(status_label(&c.view), "Timeclock: Select project");
         assert!(!db.exists());
         c.apply(Entry::Project, "new".into()).unwrap();
-        assert_eq!(status_label(&c.view), "Timeclock: Waiting for card");
+        assert_eq!(
+            status_label(&c.view),
+            "Timeclock: waiting for card new (00:00:00)"
+        );
         c.view.status = Status::Watching(WatchState::Tracking);
-        assert_eq!(status_label(&c.view), "Timeclock: tracking (00:00:00)");
+        assert_eq!(status_label(&c.view), "Timeclock: tracking new (00:00:00)");
         assert!(!db.exists());
         c.stop().unwrap();
 
@@ -751,7 +937,7 @@ mod tests {
         store.stop("removed", Some(360000)).unwrap();
         c.projects().unwrap();
         c.view.status = Status::Watching(WatchState::CardAbsent);
-        assert_eq!(status_label(&c.view), "Timeclock: paused (100:00:00)");
+        assert_eq!(status_label(&c.view), "Timeclock: paused new (100:00:00)");
         c.apply(Entry::Project, "NEW".into()).unwrap();
         assert_eq!(c.view.project_seconds, 0);
         c.apply(Entry::Project, "new".into()).unwrap();
@@ -765,7 +951,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.view.project_seconds, 60);
         c.view.status = Status::Watching(WatchState::CardAbsent);
-        assert_eq!(status_label(&c.view), "Timeclock: paused (00:01:00)");
+        assert_eq!(status_label(&c.view), "Timeclock: paused new (00:01:00)");
         let missing = dir.path().join("missing.db");
         c.apply(Entry::Database, missing.to_str().unwrap().into())
             .unwrap();
@@ -969,11 +1155,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Zenity and a graphical session; briefly opens report dialogs"]
-    fn report_without_card_or_active_project_opens_and_preserves_history() {
+    #[ignore = "requires GTK4, Zenity and a graphical session; briefly opens status/report windows"]
+    fn status_and_report_without_card_or_active_project_opens_and_preserves_history() {
         for has_history in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("report.db");
+            let mut c = controller(db.clone());
+            c.view.settings.project.clear();
+            c.action(Action::Status).unwrap();
+            c.poll().unwrap();
+            assert!(!db.exists());
+            assert!(c.worker.is_none());
             let mut store = store::Store::open(&db).unwrap();
             if has_history {
                 store.record("work", "3B00", "fake", 10).unwrap();
@@ -981,16 +1173,63 @@ mod tests {
             }
             drop(store);
             let before = store::report_text(&store::report_rows(&db).unwrap());
-            let mut c = controller(db.clone());
-            c.view.settings.project.clear();
 
             let (tx, rx) = mpsc::channel();
             c.view.tx = tx;
             ksni::Tray::activate(&mut c.view, 0, 0);
             c.action(rx.try_recv().unwrap()).unwrap();
-            let dialog_id = c.dialog.as_ref().unwrap().child.id();
+            let window = c.status_window.as_ref().unwrap().window.clone();
+            assert!(c.dialog.is_none());
+            assert_eq!(
+                c.status_window.as_ref().unwrap().label.text(),
+                "Select project"
+            );
             ksni::Tray::activate(&mut c.view, 0, 0);
             c.action(rx.try_recv().unwrap()).unwrap();
+            assert_eq!(c.status_window.as_ref().unwrap().window, window);
+            c.view.settings.project = "My_Project <&> 日本語".into();
+            c.worker = Some(Worker::spawn(|running, _| {
+                while running.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            }));
+            let worker_id = c.worker.as_ref().unwrap().thread.thread().id();
+            c.view.project_seconds = 7080;
+            c.view.status = Status::Watching(WatchState::Tracking);
+            c.poll().unwrap();
+            assert_eq!(
+                c.status_window.as_ref().unwrap().label.text(),
+                "tracking My_Project <&> 日本語 (01:58:00)"
+            );
+            c.view.project_seconds += 1;
+            c.view.status = Status::Watching(WatchState::CardAbsent);
+            for _ in 0..3 {
+                c.poll().unwrap();
+                assert_eq!(
+                    c.status_window.as_ref().unwrap().label.text(),
+                    "paused My_Project <&> 日本語 (01:58:01)"
+                );
+            }
+            window.close();
+            c.poll().unwrap();
+            assert!(!window.is_visible());
+            c.action(Action::Status).unwrap();
+            assert!(window.is_visible());
+            assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker_id);
+            assert_eq!(c.view.status, Status::Watching(WatchState::CardAbsent));
+            c.stop().unwrap();
+            c.view.status = Status::Error("Reader unavailable".into());
+            c.poll().unwrap();
+            assert_eq!(
+                c.status_window.as_ref().unwrap().label.text(),
+                "Error — Reader unavailable"
+            );
+            c.view.settings.project.clear();
+            c.view.status = Status::Idle;
+            c.action(Action::Report).unwrap();
+            let dialog_id = c.dialog.as_ref().unwrap().child.id();
+            c.action(Action::Report).unwrap();
             assert_eq!(c.dialog.as_ref().unwrap().child.id(), dialog_id);
             // Poll the real process so unsupported Zenity options cannot pass as a successful spawn.
             for _ in 0..100 {
@@ -1002,6 +1241,7 @@ mod tests {
             assert!(c.view.settings.project.is_empty());
             assert_eq!(c.view.status, Status::Idle);
             drop(c);
+            assert!(!window.is_visible());
             assert_eq!(
                 store::report_text(&store::report_rows(&db).unwrap()),
                 before
@@ -1078,6 +1318,117 @@ mod tests {
         }
     }
 
+    struct Appearance(Arc<std::sync::atomic::AtomicU32>);
+    #[zbus::interface(name = "org.freedesktop.portal.Settings")]
+    impl Appearance {
+        #[zbus(property, name = "version")]
+        fn version(&self) -> u32 {
+            1
+        }
+
+        fn read(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> zbus::fdo::Result<zbus::zvariant::OwnedValue> {
+            if namespace != APPEARANCE_NAMESPACE || key != COLOR_SCHEME_KEY {
+                return Err(zbus::fdo::Error::InvalidArgs("Unknown setting".into()));
+            }
+            Ok(self.0.load(Ordering::SeqCst).into())
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TIMECLOCK_ISOLATED_BUS=1, an isolated DBus and a graphical session"]
+    fn isolated_theme_follows_portal_initial_value_changes_and_window_lifetime() {
+        assert_eq!(std::env::var("TIMECLOCK_ISOLATED_BUS").as_deref(), Ok("1"));
+        let scheme = Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let bus = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .name("org.freedesktop.portal.Desktop")
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/portal/desktop",
+                Appearance(scheme.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        gtk4::init().unwrap();
+        let settings = gtk4::Settings::default().unwrap();
+        settings.set_gtk_application_prefer_dark_theme(false);
+        settings.set_gtk_theme_name(Some("Adwaita"));
+        settings.set_gtk_font_name(Some("Sans 10"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("unused.db");
+        let mut c = controller(db.clone());
+        c.action(Action::Status).unwrap();
+        let wait_for_theme = |c: &mut Controller, dark| {
+            for _ in 0..400 {
+                c.poll().unwrap();
+                if settings.is_gtk_application_prefer_dark_theme() == dark {
+                    let titlebar = c.status_window.as_ref().unwrap().window.titlebar().unwrap();
+                    let (minimum, natural, _, _) =
+                        titlebar.measure(gtk4::Orientation::Vertical, -1);
+                    assert_eq!((minimum, natural), (35, 35));
+                    assert!(
+                        titlebar
+                            .downcast_ref::<gtk4::HeaderBar>()
+                            .unwrap()
+                            .shows_title_buttons()
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("Desktop theme did not change to dark={dark}");
+        };
+        wait_for_theme(&mut c, true);
+        let change = |namespace: &str, key: &str, value: u32| {
+            scheme.store(value, Ordering::SeqCst);
+            bus.emit_signal(
+                None::<&str>,
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+                "SettingChanged",
+                &(namespace, key, zbus::zvariant::Value::from(value)),
+            )
+            .unwrap();
+        };
+        change(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, 2);
+        wait_for_theme(&mut c, false);
+        c.status_window.as_ref().unwrap().window.close();
+        change(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, 1);
+        wait_for_theme(&mut c, true);
+        c.action(Action::Status).unwrap();
+        assert!(settings.is_gtk_application_prefer_dark_theme());
+        change(APPEARANCE_NAMESPACE, "unrelated", 2);
+        change("org.example.unrelated", COLOR_SCHEME_KEY, 2);
+        for _ in 0..20 {
+            c.poll().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(settings.is_gtk_application_prefer_dark_theme());
+        change(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, 0);
+        wait_for_theme(&mut c, false);
+        settings.set_gtk_font_name(Some("Sans 32"));
+        let titlebar = c.status_window.as_ref().unwrap().window.titlebar().unwrap();
+        assert!(titlebar.measure(gtk4::Orientation::Vertical, -1).0 > 35);
+        settings.set_gtk_font_name(Some("Sans 10"));
+        assert!(c.worker.is_none());
+        assert!(!db.exists());
+        drop(c);
+        change(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, 1);
+        let context = glib::MainContext::default();
+        for _ in 0..20 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!settings.is_gtk_application_prefer_dark_theme());
+    }
+
     struct Watcher(Sender<String>);
     #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
     impl Watcher {
@@ -1131,7 +1482,7 @@ mod tests {
         let _: () = item.call("Activate", &(0i32, 0i32)).unwrap();
         assert!(matches!(
             received.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Action::Report
+            Action::Status
         ));
         let icons: Vec<(i32, i32, Vec<u8>)> = item.get_property("IconPixmap").unwrap();
         assert_eq!(icons[0].2.len(), 32 * 32 * 4);

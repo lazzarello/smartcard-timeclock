@@ -12,6 +12,7 @@ ctrlc = { version = "3", features = ["termination"] }
 pcsc = "2"
 rusqlite = "0.32"
 ksni = { version = "0.3.6", features = ["blocking"] }
+gtk4 = "0.10"
 
 [profile.release]
 debug = 0
