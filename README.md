@@ -4,61 +4,40 @@ A local Linux time tracker with a CLI and optional system tray. Select a project
 insert a matching smartcard to track time, and remove it to pause. Reinsert it to
 resume. Records stay in a local SQLite database; no account or network is needed.
 
-## Download
+## Deployment targets
 
-Open this repository's **Actions → CI**, choose a successful run, and download the
-`smartcard-timeclock-linux-x86_64` artifact (GitHub sign-in required). Unzip the
-artifact, then extract the binary:
+- **Binary:** Linux x86-64, Debian 12 (glibc 2.36) or compatible newer systems,
+  with PC/SC, SQLite, and GTK4 runtime libraries. Not a static binary.
+- **Tray:** [`ksni`](https://github.com/iovxw/ksni) uses StatusNotifierItem (SNI)
+  and DBusMenu, requiring a session DBus and a compatible host, such as KDE Plasma
+  or DMS / DankMaterialShell. GNOME needs an AppIndicator extension. X11 and
+  Wayland work with a compatible host; legacy XEmbed-only trays do not. Dialogs
+  require Zenity. Windows and macOS are not supported.
+- **CLI:** no desktop or tray host required; the same runtime libraries are needed.
+
+## Install
+
+Download `smartcard-timeclock-linux-x86_64.tar.gz` from
+[GitHub Releases](https://github.com/lazzarello/smartcard-timeclock/releases/latest).
+On Debian/Ubuntu, install dependencies and the extracted binary:
 
 ```sh
-tar -xzf smartcard-timeclock-linux-x86_64.tar.gz
-```
-
-This is a stripped, optimized Linux x86-64 build for Debian 12 / glibc 2.36 or
-compatible newer systems, not a static or cross-platform binary. Install the host
-libraries and reader support first. For Debian/Ubuntu:
-
-```sh
-sudo apt-get install libpcsclite1 libsqlite3-0 libgtk-4-1 pcscd libccid pcsc-tools
+sudo apt-get install libpcsclite1 libsqlite3-0 libgtk-4-1 pcscd libccid pcsc-tools zenity
 sudo systemctl enable --now pcscd.socket
-# Optional, for tray dialogs:
-sudo apt-get install zenity
+tar -xzf smartcard-timeclock-linux-x86_64.tar.gz
+sudo install -m 755 smartcard-timeclock /usr/local/bin/smartcard-timeclock
 ```
 
-Other distributions need equivalent packages and a running PC/SC service. On
-NixOS, enable `services.pcscd.enable = true;` and build in the development shell
-below rather than using the generic Linux binary.
-
-## Build
-
-Download the source with **Code → Download ZIP**, or clone this repository. Install
-Rust **1.89 or newer** with Cargo. On Debian/Ubuntu, also install:
-
-```sh
-sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev libgtk-4-dev
-```
-
-From the source directory:
-
-```sh
-cargo build --locked --release --bin smartcard-timeclock
-./target/release/smartcard-timeclock --help
-```
-
-The release binary is optimized, with debug information and symbols stripped.
-Nix/devenv users can run `devenv shell` before building; see
-[DEVELOPMENT.md](DEVELOPMENT.md) for development setup and checks.
+Other distributions need equivalent packages and a running PC/SC service. For
+source builds and NixOS, see [DEVELOPMENT.md](DEVELOPMENT.md#setup).
 
 ## Run
 
-These examples use the downloaded binary; when building locally, substitute
-`./target/release/smartcard-timeclock`.
-
 ```sh
-./smartcard-timeclock scan
-./smartcard-timeclock --db "$HOME/timeclock.sqlite3" watch "My project"
+smartcard-timeclock scan
+smartcard-timeclock --db "$HOME/timeclock.sqlite3" watch "My project"
 # In another terminal:
-./smartcard-timeclock --db "$HOME/timeclock.sqlite3" report
+smartcard-timeclock --db "$HOME/timeclock.sqlite3" report
 ```
 
 Leave `watch` running. Insertion starts timing, removal pauses it, and Ctrl-C
@@ -70,7 +49,7 @@ and starting it with another name. No time is counted while the app is stopped.
 If needed, override the reader and target ATR using values from `scan`:
 
 ```sh
-./smartcard-timeclock --db "$HOME/timeclock.sqlite3" watch "Client A" \
+smartcard-timeclock --db "$HOME/timeclock.sqlite3" watch "Client A" \
   --reader "Alcor Micro AU9540 00 00" \
   --atr "3B 68 00 00 99 02 00 D1 03 04 22 01"
 ```
@@ -81,11 +60,10 @@ A sole reader is selected automatically; multiple readers require an exact
 
 ### Optional system tray
 
-In a graphical session with Zenity, a session DBus, and a StatusNotifierItem /
-DBusMenu tray host (such as DMS / DankMaterialShell):
+In a graphical session meeting the tray requirements above:
 
 ```sh
-./smartcard-timeclock --db "$HOME/timeclock.sqlite3" tray
+smartcard-timeclock --db "$HOME/timeclock.sqlite3" tray
 ```
 
 Right-click for **Projects → New project…** or an existing project, then use the

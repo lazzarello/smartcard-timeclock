@@ -1,6 +1,6 @@
 # Development
 
-User installation, commands, and hardware requirements live in [README.md](README.md).
+Binary installation, commands, and hardware requirements live in [README.md](README.md).
 Agent-specific instructions live in [AGENTS.md](AGENTS.md).
 
 ## Setup
@@ -20,7 +20,8 @@ cargo run --locked -- scan
 
 The **host** must run `pcscd` and have a suitable reader driver. On NixOS, enable
 `services.pcscd.enable = true;`. Do not start a second pcscd inside the development
-shell. Confirm hardware independently with `pcsc_scan`.
+shell. Confirm hardware independently with `pcsc_scan`. Build on NixOS in this
+environment rather than using the generic Linux release binary.
 
 For Debian/Ubuntu:
 
@@ -30,6 +31,17 @@ sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev l
 sudo systemctl enable --now pcscd.socket
 rustup component add rustfmt clippy
 ```
+
+Clone the repository (or extract its source archive), then build and install:
+
+```sh
+cargo build --locked --release --bin smartcard-timeclock
+./target/release/smartcard-timeclock --help
+install -Dm755 target/release/smartcard-timeclock "$HOME/.local/bin/smartcard-timeclock"
+```
+
+Ensure `~/.local/bin` is on `PATH`, or run the binary from `target/release` directly.
+The release profile optimizes the binary and strips symbols and debug information.
 
 Use temporary databases for development; never point test watchers at real time
 records. For example:
@@ -88,27 +100,60 @@ fake observations and temporary databases. Three tests are ignored by default:
 
 Do not use a blanket `cargo test -- --ignored` on the desktop bus.
 
-### CI and release binary
+### CI and GitHub Releases
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) is the single GitHub Actions
-pipeline. Pushes, pull requests, and manual runs execute the checks above in
-`rust:1.89-bookworm`, including the isolated-bus test. CI installs the native
-headers and rustfmt/Clippy, but needs no pcscd service, reader, or display. The
-visible Zenity test and physical hardware checks remain manual.
+pipeline. Pushes (including tags), pull requests, and manual runs execute the
+checks above in `rust:1.89-bookworm`, including the isolated-bus test. CI installs
+the native headers and rustfmt/Clippy, but needs no pcscd service, reader, or
+display. Visible desktop and physical hardware checks remain manual.
 
-CI then builds and smoke-tests the release binary and uploads
-`smartcard-timeclock-linux-x86_64.tar.gz` as an Actions artifact. The tarball
-preserves executable permissions inside GitHub's artifact ZIP. The binary is
-optimized and stripped via `[profile.release]` in `Cargo.toml`; it dynamically
-links host libraries and targets Linux x86-64 with glibc 2.36 or compatible newer
-systems. No installer, cross-build matrix, or automatic GitHub Release publishing
-is configured. For a manual GitHub release, attach the tarball from the chosen
-successful commit after completing acceptance checks.
+Every successful run uploads the `smartcard-timeclock-linux-x86_64` Actions
+artifact containing:
 
-Before publishing: verify the artifact on the intended host, run the card/tray
-checks below, review tracked files for private data, and include the project's
-[GPL-3.0-or-later license](LICENSE.txt) and matching source with release downloads.
-Update the package version and lockfile when making a versioned release.
+- `smartcard-timeclock-linux-x86_64.tar.gz`: stripped release binary and
+  [GPL-3.0-or-later license](LICENSE.txt), preserving executable permissions.
+- `smartcard-timeclock-source.tar.gz`: matching tracked source from the same
+  commit, including `Cargo.lock` and the license.
+- `SHA256SUMS`: SHA-256 checksums for both archives; verify after downloading with
+  `sha256sum --check SHA256SUMS` in their directory.
+
+The only prebuilt target is Linux x86-64, dynamically linked against Debian 12
+libraries (glibc 2.36 baseline, PC/SC, SQLite, GTK4). Newer compatible distributions
+need those runtime libraries; NixOS uses a source build. Tray compatibility is
+protocol-based, not distribution-based: `ksni` requires an SNI/DBusMenu host on
+the session bus, with GTK4 for status and Zenity for dialogs. CI's headless test
+does not certify any particular desktop.
+
+#### Publish a release
+
+1. Update `version` in `Cargo.toml` and regenerate `Cargo.lock` with
+   `cargo check`. Commit both along with the intended changes.
+2. Push the commit and wait for CI. Download its Actions artifact, verify its
+   checksums, and test the binary on the intended host using the manual card/tray
+   acceptance steps below. Review tracked files for private data.
+3. Tag that exact accepted commit with `v` plus the package version, then push
+   the tag. For example, for package version `0.1.0`:
+
+   ```sh
+   git tag -a v0.1.0 <accepted-commit> -m "Release v0.1.0"
+   git push origin v0.1.0
+   ```
+
+4. The tag pipeline rejects a version mismatch, reruns all checks, and rebuilds
+   the archives. Only after success does its `release` job publish a GitHub
+   Release with generated notes, both archives, and `SHA256SUMS`. Only that job
+   receives `contents: write`; builds and pull requests remain read-only.
+5. Review the published release notes and download/install the public asset to
+   confirm the user path. The README's Releases link becomes usable after the
+   first release is published.
+
+Do not move published tags or replace assets; fix mistakes with a new version.
+If publishing fails before a release is created, rerun the failed job after
+fixing repository permissions. A failed check must be fixed and revalidated
+before tagging another commit. Manual workflow runs produce artifacts only;
+only a `v*` tag triggers publishing. No cross-build matrix or package repository
+is maintained.
 
 ## Code map and behavior to preserve
 
