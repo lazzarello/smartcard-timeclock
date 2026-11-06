@@ -81,9 +81,9 @@ grey idle, and red error. Remove the card before changing projects or settings.
 
 **Settings** changes the database, reader, or ATR. Choices last only for this run;
 repeat launch options to reuse them. The tray also accepts `--reader` and `--atr`.
-After fixing a reader/database error, reselect the project to retry. Keep the
-launching terminal open, or launch the binary from your desktop with an absolute
-`--db` path. No desktop configuration or autostart entry is installed.
+If an error persists, fix the reported problem and reselect the project to retry.
+Keep the launching terminal open, or launch the binary from your desktop with an
+absolute `--db` path. No desktop configuration or autostart entry is installed.
 
 ## Card hardware and identity
 
@@ -119,7 +119,7 @@ command for arbitrary contact smartcards.
   checkpoints. Removal/shutdown stop at the last confirmed checkpoint. Crash
   recovery excludes downtime but loses the uncheckpointed tail. Keep the system
   clock accurate; large clock changes can distort totals.
-- Reader/PC/SC failure stops tracking; reconnect and restart/reselect the project.
+- The app recovers automatically after sleep or a temporary reader disconnection.
 - Stop the watcher before copying the database for backup, or use SQLite's online
   backup command. Do not discard live WAL/SHM files. Local databases are ignored
   by Git, but contain project names and timing history: keep them private.

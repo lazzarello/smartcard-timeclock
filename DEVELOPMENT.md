@@ -72,7 +72,11 @@ cargo build --locked --release --bin smartcard-timeclock
 The normal tests require no physical reader or desktop. They cover ATR parsing,
 reader selection, matching, session persistence/recovery, clock rollback, write
 contention, locking, reports, tray state, settings, and dialog lifecycle using
-fake observations and temporary databases. Three tests are ignored by default:
+fake observations and temporary databases. Watcher regression tests inject PC/SC
+results and elapsed/wall clocks: repeated context/reader outages, pinned identity,
+fresh recovery/card changes, absence before/after recovery, successful polls across
+suspend or write gaps, lock ownership, retry cancellation, and terminal storage
+failures. Three tests are ignored by default:
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
   real SNI/DBusMenu protocols. **Never run it on the desktop session bus.** The
@@ -184,12 +188,29 @@ unobserved transition time cannot be reconstructed.
 
 Checkpoints are roughly once per second. Removal, Ctrl-C, SIGTERM, and reader
 failure close at the **last confirmed-presence checkpoint**, not after polling
-or SQLite waits. Reader failure exits the CLI with an error. Recovery on the
-next watch closes unfinished sessions at their last checkpoints, never at
-restart time. Whole-second UTC Unix timestamps use wall time; backwards updates
-are clamped, but large clock adjustments still distort elapsed time. Shutdown or
+or SQLite waits. Temporary reader/PC/SC interruptions keep the shared watcher and
+its database lock alive, publish `Reconnecting` (nontracking), and retry about
+once per second with cancellation-aware waits. Reestablish a new PC/SC context
+and `UNAWARE` reader state, pinning the exact initially resolved name (even with
+automatic initial selection). Never fall back to another reader. Initial reader
+validation and unexpected PC/SC/storage errors remain terminal. Recovery requires
+fresh usable matching presence; absent/different/muted/unpowered cards show Paused,
+even when no target card had been observed before the outage.
+
+Linux `/proc/uptime` supplies a suspend-inclusive elapsed clock. An observation gap
+over three seconds, including time spent in SQLite, closes at the old checkpoint
+and discards any poll result spanning that gap. Clear cached state/counters and
+require fresh observation before starting a new session; do not infer presence
+from before suspend. Clock-read failure is terminal, not a disabled guard. This
+conservative threshold can split sessions during scheduling stalls and cannot
+detect every shorter suspend. Observation timestamps/baselines are captured before
+SQLite writes. Unfinished sessions on the next watch close at their last
+checkpoints, never at restart time. Whole-second UTC Unix timestamps use wall time;
+backwards updates are clamped, but large clock adjustments still distort elapsed time. Shutdown or
 switching may wait for one poll plus SQLite's busy timeout; this wait is not
-billable time.
+billable time. Retry waits check cancellation every 50 ms. PC/SC establishment,
+listing, and context release have no native timeout argument; a wedged native call
+can still delay shutdown.
 
 ### Storage and locking
 
@@ -255,7 +276,11 @@ events are serviced by the tray controller; there is no separate timer. Reports 
 available while tracking. The selected project's total includes all persisted
 sessions/checkpoints and excludes pauses; titles and tooltips reflect the same
 project/status/time. Errors must be actionable, never shown as successful tracking.
-After fixing a watcher error, reselecting the project retries.
+Temporary reader interruptions show “Reader unavailable — reconnecting” in the
+status window/title/tooltip, with a nontracking icon and frozen checkpointed total.
+Recovery keeps the worker alive; switching while reconnecting still joins it and
+discards its queued events. After fixing a terminal watcher error, reselecting the
+project retries.
 
 Every Zenity child and pipe thread is owned and reaped on completion, Quit,
 Ctrl-C, or SIGTERM. Closing a report early may break its input pipe without making
@@ -273,8 +298,22 @@ DMS plugins, autostart entries, or desktop configuration as a side effect.
 3. Stop and run `resume` with the same name/database; totals must persist. Also
    test startup with the matching card already inserted.
 4. With only test data, check a second watcher fails to acquire the same database
-   lock. Check reader disconnect errors, graceful shutdown, and recovery after
-   terminating an active watcher; no downtime may be added.
+   lock. With and without a card, unplug/replug the same reader: unavailable/
+   reconnecting must retain the project, reader/ATR and lock; fresh matching presence
+   must resume, fresh absence must show Paused. A different or unusable card must
+   not track; another reader alone must not substitute. Repeat interruptions and
+   quit during retry. Check recovery after terminating an active watcher; no
+   downtime may be added.
+5. When explicitly permitted on the test host, repeat suspend/resume and a Nix
+   rebuild with and without the card using only temporary data. Check separate
+   sessions ending at the old checkpoint, no suspend/outage backfill, and fresh
+   post-recovery status. A successful PC/SC poll after a long gap must also split.
+   These host/hardware operations are manual acceptance only, not normal tests.
+   For totals checks, capture stdout's UTC-timestamped `Started`, `Paused`, and
+   `Reader unavailable` lines and compare against the temporary database's session
+   timestamps (query above). These logs use pre-write observation timestamps;
+   pause/outage detection can be later than the last billed checkpoint. Do not
+   treat the detection timestamp as the session's end.
 
 ### Tray / visible desktop
 

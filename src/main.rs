@@ -12,13 +12,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use clap::{Parser, Subcommand};
 use pcsc::{Context, ReaderState, Scope, State};
 
 // shortcut: ATRs identify card types; use card-specific identity if physical-card uniqueness is needed.
 const TARGET_ATR: &str = "3B 68 00 00 99 02 00 D1 03 04 22 01";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_OBSERVATION_GAP: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
 #[command(
@@ -146,7 +147,12 @@ fn scan_text() -> Result<String> {
 fn matches_target(state: State, atr: &[u8], target: &[u8]) -> bool {
     state.contains(State::PRESENT)
         && !state.intersects(
-            State::EMPTY | State::UNKNOWN | State::UNAVAILABLE | State::MUTE | State::IGNORE,
+            State::EMPTY
+                | State::UNKNOWN
+                | State::UNAVAILABLE
+                | State::MUTE
+                | State::UNPOWERED
+                | State::IGNORE,
         )
         && atr == target
 }
@@ -156,6 +162,10 @@ fn now() -> Result<i64> {
         .duration_since(UNIX_EPOCH)?
         .as_secs()
         .try_into()?)
+}
+
+fn log_timestamp(timestamp: i64) -> Result<gtk4::glib::GString> {
+    Ok(gtk4::glib::DateTime::from_unix_utc(timestamp)?.format_iso8601()?)
 }
 
 fn watcher_lock(path: &Path) -> Result<File> {
@@ -177,6 +187,7 @@ enum WatchState {
     Waiting,
     Tracking,
     CardAbsent,
+    Reconnecting,
 }
 
 fn watch(
@@ -227,41 +238,230 @@ fn monitor(
     println!("Watching {reader:?} for ATR {atr}; project {project:?}.");
     println!("Waiting for target card insertion to start or resume {project:?}.");
     eprintln!("ATR matching identifies a card type, not a unique card. Press Ctrl-C to stop.");
-    let mut states = [ReaderState::new(name, State::UNAWARE)];
-    let mut previous = None;
-    let mut seen_target = false;
-    status(WatchState::Waiting);
-    while running.load(Ordering::SeqCst) {
-        match ctx.get_status_change(POLL_INTERVAL, &mut states) {
-            Ok(()) | Err(pcsc::Error::Timeout) => {}
-            Err(error) => {
-                return Err(error)
-                    .context("PC/SC monitoring failed; reconnect the reader and restart watch");
-            }
-        }
+    let mut input = PcscInput {
+        ctx: Some(ctx),
+        states: [ReaderState::new(name.clone(), State::UNAWARE)],
+        name,
+        fresh: true,
+    };
+    monitor_input(
+        store,
+        project,
+        &reader,
+        target,
+        running,
+        status,
+        &mut input,
+        &mut std::io::stdout(),
+    )
+}
+
+fn recoverable(error: pcsc::Error) -> bool {
+    use pcsc::Error::*;
+    matches!(
+        error,
+        UnknownReader
+            | ReaderUnavailable
+            | NoReadersAvailable
+            | NoService
+            | ServiceStopped
+            | InvalidHandle
+            | Shutdown
+            | SystemCancelled
+            | CommError
+            | CommDataLost
+            | NotReady
+            | ServerTooBusy
+    )
+}
+
+// /proc/uptime includes Linux suspend time, unlike Instant's monotonic clock.
+fn boot_elapsed() -> Result<Duration> {
+    let text = std::fs::read_to_string("/proc/uptime")?;
+    let seconds: f64 = text
+        .split_whitespace()
+        .next()
+        .context("Missing boot time")?
+        .parse()?;
+    Ok(Duration::try_from_secs_f64(seconds)?)
+}
+
+fn retry_wait(running: &AtomicBool) {
+    for _ in 0..20 {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        let state = &mut states[0];
-        let flags = state.event_state();
-        if flags.intersects(State::UNKNOWN | State::UNAVAILABLE | State::IGNORE) {
-            bail!("Reader unavailable; reconnect it and restart watch");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct Observation {
+    flags: State,
+    atr: Vec<u8>,
+    count: u32,
+}
+
+// The same loop accepts fake PC/SC observations and clocks without hardware or real data.
+trait WatchInput {
+    fn poll(&mut self, reconnect: bool) -> Result<Option<Observation>, pcsc::Error>;
+    fn elapsed(&mut self) -> Result<Duration> {
+        boot_elapsed()
+    }
+    fn timestamp(&mut self) -> Result<i64> {
+        now()
+    }
+    fn wait(&mut self, running: &AtomicBool) {
+        retry_wait(running);
+    }
+}
+
+struct PcscInput {
+    ctx: Option<Context>,
+    name: CString,
+    states: [ReaderState; 1],
+    fresh: bool,
+}
+
+fn pinned_reader_present(names: &[CString], pinned: &std::ffi::CStr) -> Result<(), pcsc::Error> {
+    if names.iter().any(|name| name.as_c_str() == pinned) {
+        Ok(())
+    } else {
+        Err(pcsc::Error::UnknownReader)
+    }
+}
+
+impl WatchInput for PcscInput {
+    fn poll(&mut self, reconnect: bool) -> Result<Option<Observation>, pcsc::Error> {
+        if reconnect {
+            // Cloning a Context shares its handle; recovery needs a new establishment.
+            self.ctx = None;
+            self.fresh = true;
+            self.states = [ReaderState::new(self.name.clone(), State::UNAWARE)];
+            let ctx = Context::establish(Scope::User)?;
+            pinned_reader_present(&ctx.list_readers_owned()?, &self.name)?;
+            self.ctx = Some(ctx);
         }
-        let matching = matches_target(flags, state.atr(), target);
-        let count = state.event_count();
-        // Catch removal/reinsertion that happened between observations, where supported by pcscd.
+        match self
+            .ctx
+            .as_ref()
+            .unwrap()
+            .get_status_change(POLL_INTERVAL, &mut self.states)
+        {
+            Ok(()) => self.fresh = false,
+            Err(pcsc::Error::Timeout) if self.fresh => return Ok(None),
+            Err(pcsc::Error::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+        let state = &mut self.states[0];
+        let observation = Observation {
+            flags: state.event_state(),
+            atr: state.atr().to_vec(),
+            count: state.event_count(),
+        };
+        state.sync_current_state();
+        Ok(Some(observation))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_input(
+    store: &mut store::Store,
+    project: &str,
+    reader: &str,
+    target: &[u8],
+    running: &AtomicBool,
+    status: &mut impl FnMut(WatchState),
+    input: &mut impl WatchInput,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    let atr = format_atr(target);
+    let mut previous = None;
+    let mut seen_target = false;
+    let mut reconnect = false;
+    let mut last_observation = None;
+    status(WatchState::Waiting);
+    while running.load(Ordering::SeqCst) {
+        let before = input.elapsed()?;
+        let gap_before = last_observation.is_some_and(|last| observation_gap(last, before));
+        let result = if gap_before {
+            Ok(None)
+        } else {
+            input.poll(reconnect)
+        };
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        // Capture wall time before the gap check, so suspend here cannot advance an old session.
+        let timestamp = input.timestamp()?;
+        let observed = input.elapsed()?;
+        let gap = gap_before || observation_gap(last_observation.unwrap_or(before), observed);
+        let interruption = match result {
+            Err(error) if recoverable(error) => Some("reader_unavailable"),
+            Err(error) => return Err(error).context("PC/SC monitoring failed"),
+            _ if gap => Some("observation_gap"),
+            Ok(Some(ref observation))
+                if observation
+                    .flags
+                    .intersects(State::UNKNOWN | State::UNAVAILABLE | State::IGNORE) =>
+            {
+                Some("reader_unavailable")
+            }
+            _ => None,
+        };
+        if let Some(reason) = interruption {
+            status(WatchState::Reconnecting);
+            if !reconnect {
+                writeln!(
+                    output,
+                    "[{}] Reader unavailable — reconnecting to {reader:?} ({reason}).",
+                    log_timestamp(timestamp)?
+                )?;
+            }
+            store.stop(reason, None)?;
+            previous = None;
+            last_observation = None;
+            seen_target = true; // Fresh absence after recovery is Paused, even if initially empty.
+            reconnect = true;
+            input.wait(running);
+            continue;
+        }
+        let Some(observation) = result.unwrap() else {
+            if reconnect {
+                input.wait(running);
+            }
+            continue;
+        };
+        let matching = matches_target(observation.flags, &observation.atr, target);
+        let count = observation.count;
         if matching
             && previous.is_some_and(|(was_matching, old_count)| was_matching && old_count != count)
         {
             store.stop("card_changed", None)?;
         }
-        if matching {
-            if store.record(project, &atr, &reader, now()?)? {
-                println!("Started {project:?}.");
-            }
-        } else if store.stop("removed_or_changed", None)? {
-            println!("Paused {project:?}; waiting for target card insertion to resume.");
+        if !running.load(Ordering::SeqCst) {
+            break;
         }
+        if matching {
+            if store.record(project, &atr, reader, timestamp)? {
+                writeln!(
+                    output,
+                    "[{}] Started {project:?}.",
+                    log_timestamp(timestamp)?
+                )?;
+            }
+        } else {
+            let stopped = store.stop("removed_or_changed", None)?;
+            if stopped || reconnect {
+                writeln!(
+                    output,
+                    "[{}] Paused {project:?}; waiting for target card insertion to resume.",
+                    log_timestamp(timestamp)?
+                )?;
+            }
+        }
+        // Keep the pre-write baseline: a blocked SQLite write is also an observation gap.
+        last_observation = Some(observed);
+        reconnect = false;
         seen_target |= matching;
         status(if matching {
             WatchState::Tracking
@@ -271,9 +471,14 @@ fn monitor(
             WatchState::Waiting
         });
         previous = Some((matching, count));
-        state.sync_current_state();
     }
     Ok(())
+}
+
+fn observation_gap(previous: Duration, current: Duration) -> bool {
+    current
+        .checked_sub(previous)
+        .is_none_or(|gap| gap > MAX_OBSERVATION_GAP)
 }
 
 fn main() -> Result<()> {
@@ -307,6 +512,430 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeInput<'a> {
+        running: &'a AtomicBool,
+        steps: std::collections::VecDeque<(Result<Option<Observation>, pcsc::Error>, u64, i64)>,
+        boot: u64,
+        wall: i64,
+        resets: Vec<bool>,
+        waits: usize,
+        cancel_on_wait: bool,
+        write_delay: u64,
+        elapsed_reads: usize,
+        lock_path: Option<PathBuf>,
+    }
+
+    impl<'a> FakeInput<'a> {
+        fn new(running: &'a AtomicBool) -> Self {
+            Self {
+                running,
+                steps: Default::default(),
+                boot: 0,
+                wall: 0,
+                resets: vec![],
+                waits: 0,
+                cancel_on_wait: false,
+                write_delay: 0,
+                elapsed_reads: 0,
+                lock_path: None,
+            }
+        }
+        fn card(&mut self, flags: State, atr: &[u8], boot_delta: u64, wall: i64) {
+            self.steps.push_back((
+                Ok(Some(Observation {
+                    flags,
+                    atr: atr.to_vec(),
+                    count: 0,
+                })),
+                boot_delta,
+                wall,
+            ));
+        }
+        fn error(&mut self, error: pcsc::Error) {
+            self.steps.push_back((Err(error), 1, self.wall));
+        }
+    }
+
+    impl WatchInput for FakeInput<'_> {
+        fn poll(&mut self, reconnect: bool) -> Result<Option<Observation>, pcsc::Error> {
+            if let Some(path) = &self.lock_path {
+                assert!(watcher_lock(path).is_err());
+            }
+            let Some((result, delta, wall)) = self.steps.pop_front() else {
+                self.running.store(false, Ordering::SeqCst);
+                return Ok(None);
+            };
+            self.resets.push(reconnect);
+            self.boot += delta;
+            self.wall = wall;
+            result
+        }
+        fn elapsed(&mut self) -> Result<Duration> {
+            self.elapsed_reads += 1;
+            let elapsed = Duration::from_secs(self.boot);
+            // Simulate a write stall after capturing the first observation's baseline.
+            if self.elapsed_reads == 2 {
+                self.boot += std::mem::take(&mut self.write_delay);
+            }
+            Ok(elapsed)
+        }
+        fn timestamp(&mut self) -> Result<i64> {
+            Ok(self.wall)
+        }
+        fn wait(&mut self, running: &AtomicBool) {
+            self.waits += 1;
+            if self.cancel_on_wait {
+                running.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn run_fake(store: &mut store::Store, input: &mut FakeInput<'_>) -> Result<Vec<WatchState>> {
+        let mut states = vec![];
+        monitor_input(
+            store,
+            "work",
+            "pinned",
+            &[0x3b, 0],
+            input.running,
+            &mut |state| states.push(state),
+            input,
+            &mut std::io::sink(),
+        )?;
+        Ok(states)
+    }
+
+    #[test]
+    fn recovery_repeated_context_loss_requires_fresh_observations_and_keeps_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clock.db");
+        let mut store = store::Store::open(&db).unwrap();
+        let lock = watcher_lock(&db).unwrap();
+        let running = AtomicBool::new(true);
+        let mut input = FakeInput::new(&running);
+        input.lock_path = Some(db.clone());
+        input.card(State::PRESENT, &[0x3b, 0], 1, 10);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 12);
+        input.card(State::UNAVAILABLE, &[], 1, 13);
+        input.error(pcsc::Error::ServiceStopped);
+        input.error(pcsc::Error::InvalidHandle);
+        // A timeout from a fresh UNAWARE reader is not confirmation of presence.
+        input.steps.push_back((Ok(None), 1, 50));
+        input.card(State::PRESENT, &[0x3b, 0], 1, 100);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 102);
+        input.error(pcsc::Error::UnknownReader);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 200);
+        let states = run_fake(&mut store, &mut input).unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| **s == WatchState::Reconnecting)
+                .count(),
+            4
+        );
+        assert_eq!(
+            input.resets,
+            [
+                false, false, false, true, true, true, true, false, false, true
+            ]
+        );
+        store.stop("shutdown", None).unwrap();
+        let rows = store::report_rows(&db).unwrap();
+        assert_eq!((rows[0].seconds, rows[0].sessions, rows[0].open), (4, 3, 0));
+        assert!(watcher_lock(&db).is_err());
+        drop(lock);
+        assert!(watcher_lock(&db).is_ok());
+    }
+
+    #[test]
+    fn recovery_absent_changed_and_unusable_cards_never_accrue() {
+        for flags in [
+            State::EMPTY,
+            State::PRESENT,
+            State::PRESENT | State::MUTE,
+            State::PRESENT | State::UNPOWERED,
+        ] {
+            for initially_matching in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = dir.path().join("clock.db");
+                let mut store = store::Store::open(&db).unwrap();
+                let running = AtomicBool::new(true);
+                let mut input = FakeInput::new(&running);
+                input.card(
+                    if initially_matching {
+                        State::PRESENT
+                    } else {
+                        State::EMPTY
+                    },
+                    &[0x3b, 0],
+                    1,
+                    10,
+                );
+                input.card(State::UNKNOWN, &[], 1, 11);
+                input.card(
+                    flags,
+                    if flags == State::PRESENT {
+                        &[0x3b, 1]
+                    } else {
+                        &[0x3b, 0]
+                    },
+                    1,
+                    100,
+                );
+                let mut states = vec![];
+                let mut output = Vec::new();
+                // A second absent observation must not repeat the recovery announcement.
+                input.card(State::EMPTY, &[], 1, 101);
+                monitor_input(
+                    &mut store,
+                    "work",
+                    "pinned",
+                    &[0x3b, 0],
+                    &running,
+                    &mut |state| states.push(state),
+                    &mut input,
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(*states.last().unwrap(), WatchState::CardAbsent);
+                let output = String::from_utf8(output).unwrap();
+                assert_eq!(
+                    output
+                        .matches("Paused \"work\"; waiting for target card insertion to resume.")
+                        .count(),
+                    1,
+                    "{output}"
+                );
+                let rows = store::report_rows(&db).unwrap();
+                assert!(rows.iter().all(|row| row.seconds == 0 && row.open == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn transition_logs_include_utc_observation_timestamps_on_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clock.db");
+        let mut store = store::Store::open(&db).unwrap();
+        let running = AtomicBool::new(true);
+        let mut input = FakeInput::new(&running);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 10);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 11);
+        input.card(State::EMPTY, &[], 1, 12);
+        input.card(State::UNAVAILABLE, &[], 1, 13);
+        input.card(State::EMPTY, &[], 1, 14);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 15);
+        let mut output = Vec::new();
+        monitor_input(
+            &mut store,
+            "work",
+            "pinned",
+            &[0x3b, 0],
+            &running,
+            &mut |_| {},
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "[1970-01-01T00:00:10Z] Started \"work\".\n",
+                "[1970-01-01T00:00:12Z] Paused \"work\"; waiting for target card insertion to resume.\n",
+                "[1970-01-01T00:00:13Z] Reader unavailable — reconnecting to \"pinned\" (reader_unavailable).\n",
+                "[1970-01-01T00:00:14Z] Paused \"work\"; waiting for target card insertion to resume.\n",
+                "[1970-01-01T00:00:15Z] Started \"work\".\n",
+            )
+        );
+    }
+
+    #[test]
+    fn successful_poll_after_suspend_or_write_gap_cannot_bridge_sessions() {
+        for gap_kind in ["successful_poll", "timeout", "write"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("clock.db");
+            let mut store = store::Store::open(&db).unwrap();
+            let running = AtomicBool::new(true);
+            let mut input = FakeInput::new(&running);
+            input.card(State::PRESENT, &[0x3b, 0], 1, 10);
+            if gap_kind == "write" {
+                input.write_delay = 30;
+            } else if gap_kind == "timeout" {
+                input.steps.push_back((Ok(None), 30, 40));
+            } else {
+                input.card(State::PRESENT, &[0x3b, 0], 30, 40);
+            }
+            input.card(State::PRESENT, &[0x3b, 0], 1, 100);
+            input.card(State::PRESENT, &[0x3b, 0], 1, 102);
+            let states = run_fake(&mut store, &mut input).unwrap();
+            assert!(states.contains(&WatchState::Reconnecting));
+            store.stop("shutdown", None).unwrap();
+            let rows = store::report_rows(&db).unwrap();
+            assert_eq!((rows[0].seconds, rows[0].sessions), (2, 2));
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let end: i64 = conn
+                .query_row(
+                    "SELECT ended_at FROM sessions ORDER BY id LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(end, 10);
+        }
+        assert!(!observation_gap(Duration::ZERO, MAX_OBSERVATION_GAP));
+        assert!(observation_gap(
+            Duration::from_secs(5),
+            Duration::from_secs(4)
+        ));
+        assert!(boot_elapsed().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn recovery_only_accepts_the_pinned_exact_reader() {
+        let pinned = CString::new("exact reader 00").unwrap();
+        for names in [
+            vec![],
+            vec![CString::new("exact reader 01").unwrap()],
+            vec![CString::new("other").unwrap()],
+        ] {
+            assert_eq!(
+                pinned_reader_present(&names, &pinned),
+                Err(pcsc::Error::UnknownReader)
+            );
+        }
+        assert!(
+            pinned_reader_present(&[CString::new("other").unwrap(), pinned.clone()], &pinned)
+                .is_ok()
+        );
+        for error in [
+            pcsc::Error::UnknownReader,
+            pcsc::Error::ReaderUnavailable,
+            pcsc::Error::NoReadersAvailable,
+            pcsc::Error::NoService,
+            pcsc::Error::ServiceStopped,
+            pcsc::Error::InvalidHandle,
+            pcsc::Error::Shutdown,
+            pcsc::Error::SystemCancelled,
+            pcsc::Error::CommError,
+            pcsc::Error::CommDataLost,
+            pcsc::Error::NotReady,
+            pcsc::Error::ServerTooBusy,
+        ] {
+            assert!(recoverable(error));
+        }
+        assert!(!recoverable(pcsc::Error::InvalidParameter));
+        assert!(!recoverable(pcsc::Error::Timeout));
+    }
+
+    #[test]
+    fn cancellation_joins_a_retrying_watcher_and_releases_its_lock() {
+        struct Unavailable(std::sync::mpsc::Sender<()>);
+        impl WatchInput for Unavailable {
+            fn poll(&mut self, _: bool) -> Result<Option<Observation>, pcsc::Error> {
+                Err(pcsc::Error::NoService)
+            }
+            fn wait(&mut self, running: &AtomicBool) {
+                self.0.send(()).unwrap();
+                retry_wait(running);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clock.db");
+        let path = db.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        let (ready, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut store = store::Store::open(&path).unwrap();
+            let _lock = watcher_lock(&path).unwrap();
+            store.record("work", "3B00", "pinned", 10).unwrap();
+            store.record("work", "3B00", "pinned", 12).unwrap();
+            monitor_input(
+                &mut store,
+                "work",
+                "pinned",
+                &[0x3b, 0],
+                &flag,
+                &mut |_| {},
+                &mut Unavailable(ready),
+                &mut std::io::sink(),
+            )
+            .unwrap();
+            store.stop("shutdown", None).unwrap();
+        });
+        let ready = wait.recv_timeout(Duration::from_secs(2));
+        let locked = watcher_lock(&db).is_err();
+        let start = std::time::Instant::now();
+        running.store(false, Ordering::SeqCst);
+        thread.join().unwrap();
+        assert!(ready.is_ok());
+        assert!(locked);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(watcher_lock(&db).is_ok());
+        let rows = store::report_rows(&db).unwrap();
+        assert_eq!((rows[0].seconds, rows[0].open), (2, 0));
+    }
+
+    #[test]
+    fn retry_cancellation_and_fatal_errors_do_not_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clock.db");
+        let mut store = store::Store::open(&db).unwrap();
+        let running = AtomicBool::new(true);
+        let mut input = FakeInput::new(&running);
+        input.error(pcsc::Error::NoService);
+        input.cancel_on_wait = true;
+        assert_eq!(
+            run_fake(&mut store, &mut input).unwrap().last(),
+            Some(&WatchState::Reconnecting)
+        );
+        assert_eq!(input.waits, 1);
+        let start = std::time::Instant::now();
+        retry_wait(&running);
+        assert!(start.elapsed() < Duration::from_millis(100));
+
+        running.store(true, Ordering::SeqCst);
+        let mut input = FakeInput::new(&running);
+        input.error(pcsc::Error::InvalidParameter);
+        assert!(run_fake(&mut store, &mut input).is_err());
+        assert_eq!(input.waits, 0);
+
+        // Real SQLite failure must propagate, not become a reader retry.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_write BEFORE INSERT ON sessions BEGIN SELECT RAISE(FAIL, 'test storage failure'); END;").unwrap();
+        let mut input = FakeInput::new(&running);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 10);
+        assert!(
+            run_fake(&mut store, &mut input)
+                .unwrap_err()
+                .to_string()
+                .contains("test storage failure")
+        );
+        assert_eq!(input.waits, 0);
+
+        conn.execute_batch(
+            "DROP TRIGGER fail_write;
+            CREATE TRIGGER fail_stop BEFORE UPDATE ON sessions WHEN NEW.ended_at IS NOT NULL
+            BEGIN SELECT RAISE(FAIL, 'test closure failure'); END;",
+        )
+        .unwrap();
+        let mut input = FakeInput::new(&running);
+        input.card(State::PRESENT, &[0x3b, 0], 1, 10);
+        input.error(pcsc::Error::NoService);
+        assert!(
+            run_fake(&mut store, &mut input)
+                .unwrap_err()
+                .to_string()
+                .contains("test closure failure")
+        );
+        assert_eq!(input.waits, 0);
+        // Failed closure leaves the persisted checkpoint available for crash recovery.
+        conn.execute_batch("DROP TRIGGER fail_stop;").unwrap();
+        store.recover().unwrap();
+        let rows = store::report_rows(&db).unwrap();
+        assert_eq!((rows[0].seconds, rows[0].open), (0, 0));
+    }
 
     #[test]
     fn atr_formats_and_validation() {
@@ -345,6 +974,7 @@ mod tests {
             State::UNKNOWN,
             State::UNAVAILABLE,
             State::MUTE,
+            State::UNPOWERED,
             State::IGNORE,
         ] {
             assert!(!matches_target(flags, &target, &target));
