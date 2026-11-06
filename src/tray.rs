@@ -28,6 +28,7 @@ impl Status {
             Self::Watching(WatchState::Waiting) => "Waiting for card".into(),
             Self::Watching(WatchState::Tracking) => "Tracking".into(),
             Self::Watching(WatchState::CardAbsent) => "Paused".into(),
+            Self::Watching(WatchState::Reconnecting) => "Reader unavailable — reconnecting".into(),
             Self::Error(error) => format!("Error — {error}"),
         }
     }
@@ -118,6 +119,9 @@ impl Tray {
                 Status::Watching(WatchState::Waiting) => Some("Waiting for card"),
                 Status::Watching(WatchState::Tracking) => Some("Tracking"),
                 Status::Watching(WatchState::CardAbsent) => Some("Paused"),
+                Status::Watching(WatchState::Reconnecting) => {
+                    Some("Reader unavailable — reconnecting")
+                }
                 _ => None,
             };
             if let Some(state) = state {
@@ -781,6 +785,7 @@ mod tests {
             Status::Watching(WatchState::Waiting),
             Status::Watching(WatchState::Tracking),
             Status::Watching(WatchState::CardAbsent),
+            Status::Watching(WatchState::Reconnecting),
             Status::Error("Reader unavailable".into()),
         ] {
             c.view.status = status.clone();
@@ -867,6 +872,12 @@ mod tests {
             c.poll().unwrap();
             assert_eq!(status_label(&c.view), "Paused old_project <&> (01:02:06)");
         }
+        update(&mut c, WatchState::Reconnecting);
+        assert_eq!(
+            status_label(&c.view),
+            "Reader unavailable — reconnecting old_project <&> (01:02:06)"
+        );
+        assert!(c.view.editable());
         store.record(&project, "3B00", "fake", 20000).unwrap();
         update(&mut c, WatchState::Tracking);
         assert_eq!(status_label(&c.view), "Tracking old_project <&> (01:02:06)");
@@ -920,51 +931,54 @@ mod tests {
 
     #[test]
     fn selection_arms_watcher_and_switch_joins_before_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("clock.db");
-        let mut c = controller(db.clone());
-        let (ready, wait) = mpsc::channel();
-        c.worker = Some(Worker::spawn(move |running, tx| {
-            let mut store = store::Store::open(&db)?;
-            let _lock = watcher_lock(&db)?;
-            store.record("old_project <&>", "3B00", "fake", 10)?;
-            store.stop("removed_or_changed", Some(15))?;
-            tx.send(WatchState::CardAbsent)?;
-            ready.send(())?;
-            while running.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(1));
-            }
-            store.stop("shutdown", None)?;
-            Ok(())
-        }));
-        wait.recv_timeout(Duration::from_secs(2)).unwrap();
-        let id = c.worker.as_ref().unwrap().thread.thread().id();
-        c.start_watching().unwrap();
-        c.start_watching().unwrap();
-        assert_eq!(id, c.worker.as_ref().unwrap().thread.thread().id());
-        c.poll().unwrap();
-        assert_eq!(c.view.status, Status::Watching(WatchState::CardAbsent));
-        c.action(Action::Select("new_项目".into())).unwrap();
-        assert_ne!(id, c.worker.as_ref().unwrap().thread.thread().id());
-        assert_eq!(c.view.status, Status::Watching(WatchState::Waiting));
-        assert_eq!(c.view.settings.project, "new_项目");
-        let rows = store::report_rows(&c.view.settings.db).unwrap();
-        assert_eq!((rows[0].seconds, rows[0].open), (5, 0));
-        // Selecting another project arms it without recording any absent-card time.
-        c.poll().unwrap();
-        assert!(c.worker.is_some());
-        c.stop().unwrap();
-        let mut store = store::Store::open(&c.view.settings.db).unwrap();
-        let _lock = watcher_lock(&c.view.settings.db).unwrap();
-        store
-            .record("old_project <&>", "3B00", "fake", 1000)
-            .unwrap();
-        store.stop("shutdown", Some(1005)).unwrap();
-        let rows = store::report_rows(&c.view.settings.db).unwrap();
-        assert_eq!(
-            (rows[0].seconds, rows[0].sessions, rows[0].open),
-            (10, 2, 0)
-        );
+        for state in [WatchState::CardAbsent, WatchState::Reconnecting] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("clock.db");
+            let mut c = controller(db.clone());
+            let (ready, wait) = mpsc::channel();
+            c.worker = Some(Worker::spawn(move |running, tx| {
+                let mut store = store::Store::open(&db)?;
+                let _lock = watcher_lock(&db)?;
+                store.record("old_project <&>", "3B00", "fake", 10)?;
+                store.stop("removed_or_changed", Some(15))?;
+                tx.send(state)?;
+                ready.send(())?;
+                while running.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                tx.send(WatchState::Tracking)?; // Must be discarded when joining the old worker.
+                store.stop("shutdown", None)?;
+                Ok(())
+            }));
+            wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            let id = c.worker.as_ref().unwrap().thread.thread().id();
+            c.start_watching().unwrap();
+            c.start_watching().unwrap();
+            assert_eq!(id, c.worker.as_ref().unwrap().thread.thread().id());
+            c.poll().unwrap();
+            assert_eq!(c.view.status, Status::Watching(state));
+            c.action(Action::Select("new_项目".into())).unwrap();
+            assert_ne!(id, c.worker.as_ref().unwrap().thread.thread().id());
+            assert_eq!(c.view.status, Status::Watching(WatchState::Waiting));
+            assert_eq!(c.view.settings.project, "new_项目");
+            let rows = store::report_rows(&c.view.settings.db).unwrap();
+            assert_eq!((rows[0].seconds, rows[0].open), (5, 0));
+            // Selecting another project arms it without recording any absent-card time.
+            c.poll().unwrap();
+            assert!(c.worker.is_some());
+            c.stop().unwrap();
+            let mut store = store::Store::open(&c.view.settings.db).unwrap();
+            let _lock = watcher_lock(&c.view.settings.db).unwrap();
+            store
+                .record("old_project <&>", "3B00", "fake", 1000)
+                .unwrap();
+            store.stop("shutdown", Some(1005)).unwrap();
+            let rows = store::report_rows(&c.view.settings.db).unwrap();
+            assert_eq!(
+                (rows[0].seconds, rows[0].sessions, rows[0].open),
+                (10, 2, 0)
+            );
+        }
     }
 
     #[test]
@@ -1072,7 +1086,7 @@ mod tests {
         let mut c = controller(dir.path().join("unused.db"));
         c.worker = Some(Worker::spawn(|_, tx| {
             tx.send(WatchState::Tracking)?;
-            bail!("close failed")
+            anyhow::bail!("close failed")
         }));
         while !c.worker.as_ref().unwrap().thread.is_finished() {
             thread::sleep(Duration::from_millis(1));
@@ -1098,7 +1112,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        bail!("Fake dialog timed out")
+        anyhow::bail!("Fake dialog timed out")
     }
     #[test]
     fn dialogs_preserve_input_distinguish_cancel_and_reap_on_drop() {

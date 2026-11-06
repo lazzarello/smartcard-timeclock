@@ -45,6 +45,9 @@ exits. A matching card already inserted at startup starts immediately. Run
 `resume "My project"` (an alias for `watch`) to continue after exiting. Project
 names are exact and case-sensitive; switching projects means stopping the watcher
 and starting it with another name. No time is counted while the app is stopped.
+`Started`, `Paused`, and `Reader unavailable` messages go to stdout with UTC
+observation timestamps, for example `[2026-11-06T17:43:15Z] Started "My project".`
+Pause/outage timestamps mark detection, not the last billed checkpoint.
 
 If needed, override the reader and target ATR using values from `scan`:
 
@@ -81,7 +84,8 @@ grey idle, and red error. Remove the card before changing projects or settings.
 
 **Settings** changes the database, reader, or ATR. Choices last only for this run;
 repeat launch options to reuse them. The tray also accepts `--reader` and `--atr`.
-After fixing a reader/database error, reselect the project to retry. Keep the
+Temporary reader/PC/SC interruptions recover automatically; terminal errors (including
+database errors) require fixing the error and reselecting the project. Keep the
 launching terminal open, or launch the binary from your desktop with an absolute
 `--db` path. No desktop configuration or autostart entry is installed.
 
@@ -119,7 +123,15 @@ command for arbitrary contact smartcards.
   checkpoints. Removal/shutdown stop at the last confirmed checkpoint. Crash
   recovery excludes downtime but loses the uncheckpointed tail. Keep the system
   clock accurate; large clock changes can distort totals.
-- Reader/PC/SC failure stops tracking; reconnect and restart/reselect the project.
+- Temporary reader/PC/SC loss shows **Reader unavailable — reconnecting** and
+  automatically retries the same exact reader, retaining the project and ATR.
+  No other reader is substituted. Fresh usable matching presence resumes Tracking;
+  absence, a different ATR, or an unusable card shows Paused after recovery.
+- Outages end at the last checkpoint. Linux suspend-inclusive observation gaps
+  over three seconds also split sessions and force fresh presence confirmation,
+  even if PC/SC succeeds. Suspend/outage time is not backfilled. This conservative
+  guard may split sessions during scheduling or database stalls; it does not
+  detect every shorter suspend. Unexpected PC/SC or storage errors remain terminal.
 - Stop the watcher before copying the database for backup, or use SQLite's online
   backup command. Do not discard live WAL/SHM files. Local databases are ignored
   by Git, but contain project names and timing history: keep them private.
