@@ -1430,6 +1430,7 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut c = controller(dir.path().join("untouched.db"));
+        c.view.settings.project.clear();
         let (actions, received) = mpsc::channel();
         c.view.tx = actions;
         c.projects().unwrap();
@@ -1453,6 +1454,56 @@ mod tests {
                 .contains("Select project")
         );
         assert!(!item.get_property::<bool>("ItemIsMenu").unwrap());
+        let menu: zbus::zvariant::OwnedObjectPath = item.get_property("Menu").unwrap();
+        let menu_proxy = zbus::blocking::Proxy::new(
+            &bus,
+            name.as_str(),
+            menu.as_str(),
+            "com.canonical.dbusmenu",
+        )
+        .unwrap();
+        type Layout = (
+            i32,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            Vec<zbus::zvariant::OwnedValue>,
+        );
+        // Hosts render right-click menus; requesting one must not open an app window.
+        let context_menu: zbus::Result<()> = item.call("ContextMenu", &(0i32, 0i32));
+        assert!(matches!(
+            context_menu,
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+        ));
+        let needs_update: bool = menu_proxy.call("AboutToShow", &(0i32,)).unwrap();
+        assert!(!needs_update);
+        let (_, idle_layout): (u32, Layout) = menu_proxy
+            .call("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))
+            .unwrap();
+        assert!(!idle_layout.2.is_empty());
+        for event in ["opened", "closed"] {
+            let _: () = menu_proxy
+                .call(
+                    "Event",
+                    &(0i32, event, zbus::zvariant::Value::from(0i32), 0u32),
+                )
+                .unwrap();
+            handle.update(|tray| *tray = c.view.clone());
+        }
+        c.poll().unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(c.view.status, Status::Idle);
+        assert!(c.view.settings.project.is_empty());
+        assert!(c.worker.is_none());
+        assert!(c.status_window.is_none());
+        assert!(c.dialog.is_none());
+        assert!(!c.view.settings.db.exists());
+
+        c.view.settings.project = "old_project <&>".into();
+        c.projects().unwrap();
+        handle.update(|tray| *tray = c.view.clone());
         let _: () = item.call("Activate", &(0i32, 0i32)).unwrap();
         assert!(matches!(
             received.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -1460,7 +1511,6 @@ mod tests {
         ));
         let icons: Vec<(i32, i32, Vec<u8>)> = item.get_property("IconPixmap").unwrap();
         assert_eq!(icons[0].2.len(), 32 * 32 * 4);
-        let menu: zbus::zvariant::OwnedObjectPath = item.get_property("Menu").unwrap();
         let output = ProcessCommand::new("dbus-send")
             .args([
                 "--session",
@@ -1493,18 +1543,6 @@ mod tests {
         }
         assert!(!text.contains("Resume selected project"));
         assert!(!text.contains("Pause / stop watching"));
-        let menu_proxy = zbus::blocking::Proxy::new(
-            &bus,
-            name.as_str(),
-            menu.as_str(),
-            "com.canonical.dbusmenu",
-        )
-        .unwrap();
-        type Layout = (
-            i32,
-            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-            Vec<zbus::zvariant::OwnedValue>,
-        );
         let (_, layout): (u32, Layout) = menu_proxy
             .call("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))
             .unwrap();

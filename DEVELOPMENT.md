@@ -79,9 +79,10 @@ suspend or write gaps, lock ownership, retry cancellation, and terminal storage
 failures. Three tests are ignored by default:
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
-  real SNI/DBusMenu protocols. **Never run it on the desktop session bus.** The
-  command above provides an isolated bus and requires `dbus-run-session`,
-  `dbus-send`, and `timeout`.
+  real SNI/DBusMenu protocols, including idle menu requests that must not open
+  app windows, arm a watcher, or create a database. **Never run it on the desktop
+  session bus.** The command above provides an isolated bus and requires
+  `dbus-run-session`, `dbus-send`, and `timeout`.
 - `status_and_report_without_card_or_active_project…` opens a real GTK4 status
   window and Zenity report dialogs. It checks live text, literal project names,
   singleton/reopen behavior, and unchanged report history. Run it separately in a
@@ -107,9 +108,10 @@ Do not use a blanket `cargo test -- --ignored` on the desktop bus.
 ### CI and GitHub Releases
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) is the single GitHub Actions
-pipeline. Pushes (including tags), pull requests, and manual runs execute the
-checks above in `rust:1.89-bookworm`, including the isolated-bus test. CI installs
-the native headers and rustfmt/Clippy, but needs no pcscd service, reader, or
+pipeline. Pull requests, pushes to `main` or `v*` tags, and manual runs execute
+the checks above in `rust:1.89-bookworm`, including the isolated-bus test. Feature
+branch pushes do not trigger separate runs; open or update a PR to run CI.
+CI installs the native headers and rustfmt/Clippy, but needs no pcscd service, reader, or
 display. Visible desktop and physical hardware checks remain manual.
 
 Every successful run uploads the `smartcard-timeclock-linux-x86_64` Actions
@@ -133,8 +135,8 @@ does not certify any particular desktop.
 
 1. Update `version` in `Cargo.toml` and regenerate `Cargo.lock` with
    `cargo check`. Commit both along with the intended changes.
-2. Push the commit and wait for CI. Download its Actions artifact, verify its
-   checksums, and test the binary on the intended host using the manual card/tray
+2. Merge or push the commit to `main` and wait for CI. Download its Actions artifact,
+   verify its checksums, and test the binary on the intended host using the manual card/tray
    acceptance steps below. Review tracked files for private data.
 3. Tag that exact accepted commit with `v` plus the package version, then push
    the tag. For example, for package version `0.1.0`:
@@ -260,7 +262,11 @@ must change nothing. Join the previous watcher before switching and discard its
 event queue so stale events cannot affect the new selection.
 
 Left-click opens/reuses a compact read-only GTK4 status window; right-click opens
-the unchanged action menu, including Report. The status line is, for example,
+the host-rendered DBusMenu, including Report. Menu layout requests and opened/closed
+events must not open GTK/Zenity windows or arm a watcher. For a menu-opening flash,
+distinguish the host's surface (such as DMS's `dms:tray-menu-window` layer) from the
+app's `Timeclock status` window before changing app window code.
+The status line is, for example,
 `Tracking My Project (01:58:00)` or `Paused My Project (01:58:01)`. It updates while
 open, freezes during pauses, and shows selection/waiting/error states honestly.
 Closing the window does not stop the watcher. The native GTK header bar uses
@@ -324,9 +330,12 @@ cargo run --locked -- --db "$test_dir/acceptance.sqlite3" tray
 rm -r -- "$test_dir"
 ```
 
-1. Confirm a visible clock icon in DMS (or the intended host). Right-click for
-   the full menu; **Settings → Database path…** shows the absolute path. Verify
-   Zenity entry/cancellation and screen-reader labels/focus. Left-click opens a
+1. Confirm a visible clock icon in DMS (or the intended host). With no card and
+   no selected project, right-click and dismiss the menu repeatedly: no extra
+   window or top-left flash should appear, and tracking must remain idle. Check
+   both the first opening and subsequent openings. **Settings → Database path…**
+   shows the absolute path. Verify Zenity entry/cancellation and screen-reader
+   labels/focus. Left-click opens a
    compact read-only status window, even before recording a session; repeated
    clicks must reuse it. Verify keyboard focus, text selection/screen-reader
    output, closing, and reopening without changing tracking. Toggle the desktop's
