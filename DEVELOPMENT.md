@@ -105,6 +105,48 @@ failures. Three tests are ignored by default:
 
 Do not use a blanket `cargo test -- --ignored` on the desktop bus.
 
+### Test organization and everyday use
+
+Rust distinguishes tests by how they are compiled, not just by their directory:
+
+- **Unit tests** are modules inside the application crate. They can test private
+  functions without making those functions public. The CLI/watcher tests and
+  their fake input live in `src/tests/mod.rs`; `#[cfg(test)] mod tests;` in
+  `src/main.rs` loads that file only for test builds. `use super::*;` imports
+  items from the parent module (`main.rs`). Store and tray unit tests remain in
+  their respective source files. Inline and separate-file unit tests are both
+  normal Rust layouts.
+- **Integration tests** go in the repository-root `tests/` directory. Cargo
+  builds each top-level `.rs` file there as a separate test crate. They cannot
+  access this binary's private functions; use them for black-box CLI checks,
+  launching `env!("CARGO_BIN_EXE_smartcard-timeclock")` with `std::process::Command`.
+  This project does not currently have integration tests. Do not expose internals
+  or include `main.rs` in another crate just to move unit tests there.
+
+Enter `devenv shell` first when using the Nix development environment. Useful
+commands (in addition to the full checks above):
+
+```sh
+# Run the normal suite.
+cargo test --locked --all-targets
+# Run one test by name (the filter matches substrings).
+cargo test --locked atr_formats_and_validation
+# Select exactly one relocated test by its full module path.
+cargo test --locked tests::atr_formats_and_validation -- --exact
+# Show stdout/stderr even for passing tests.
+cargo test --locked atr_formats_and_validation -- --nocapture
+# List tests without running them.
+cargo test --locked --all-targets -- --list
+```
+
+Add a `#[test] fn descriptive_behavior_name()` to the relevant unit-test module
+and assert the observable result with `assert!` or `assert_eq!`. Keep tests
+independent: Cargo runs them in parallel by default, so use a fresh temporary
+folder/database per test and fake card observations/clocks rather than real
+hardware or sleeps. Keep test-only dependencies under `[dev-dependencies]` in
+`Cargo.toml`. Preserve the explicit ignored-test commands and bus isolation
+above for desktop/protocol checks.
+
 ### CI and GitHub Releases
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) is the single GitHub Actions
@@ -170,8 +212,10 @@ is maintained.
 - `src/tray.rs`: SNI/DBusMenu presentation, controller, worker ownership, and
   Zenity dialog lifecycle. It uses the same watcher/store as the CLI, not a
   separate timer.
-- Tests live next to their implementation under `#[cfg(test)]`. `Cargo.lock` is
-  committed for reproducible application builds.
+- `src/tests/mod.rs`: CLI/watcher unit tests and fake observations, loaded by
+  `#[cfg(test)] mod tests;` in `src/main.rs`. Store and tray unit tests remain
+  inline under `#[cfg(test)]` in their implementation modules.
+- `Cargo.lock` is committed for reproducible application builds.
 
 ### Card observation and timing
 
