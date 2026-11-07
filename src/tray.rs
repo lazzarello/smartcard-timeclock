@@ -504,9 +504,20 @@ impl Controller {
             .iter()
             .find(|row| row.project == self.view.settings.project)
             .map_or(0, |row| row.seconds);
-        self.view.projects = rows.into_iter().map(|row| row.project).collect();
+        let projects = if self.view.settings.db.try_exists()? {
+            store::project_rows(&self.view.settings.db)?
+        } else {
+            Vec::new()
+        };
+        self.view.projects = projects
+            .iter()
+            .filter(|project| !project.archived)
+            .map(|project| project.name.clone())
+            .collect();
         if !self.view.settings.project.is_empty()
-            && !self.view.projects.contains(&self.view.settings.project)
+            && !projects
+                .iter()
+                .any(|project| project.name == self.view.settings.project)
         {
             self.view.projects.push(self.view.settings.project.clone());
         }
@@ -938,7 +949,6 @@ mod tests {
             let (ready, wait) = mpsc::channel();
             c.worker = Some(Worker::spawn(move |running, tx| {
                 let mut store = store::Store::open(&db)?;
-                let _lock = watcher_lock(&db)?;
                 store.record("old_project <&>", "3B00", "fake", 10)?;
                 store.stop("removed_or_changed", Some(15))?;
                 tx.send(state)?;
@@ -968,7 +978,6 @@ mod tests {
             assert!(c.worker.is_some());
             c.stop().unwrap();
             let mut store = store::Store::open(&c.view.settings.db).unwrap();
-            let _lock = watcher_lock(&c.view.settings.db).unwrap();
             store
                 .record("old_project <&>", "3B00", "fake", 1000)
                 .unwrap();
@@ -979,6 +988,33 @@ mod tests {
                 (10, 2, 0)
             );
         }
+    }
+
+    #[test]
+    fn project_discovery_uses_registry_and_never_readds_an_archived_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("projects.db");
+        let mut c = controller(db.clone());
+        let mut store = store::Store::open(&db).unwrap();
+        let selected = c.view.settings.project.clone();
+        store.create_project(&selected).unwrap();
+        store.create_project("zero sessions").unwrap();
+        store.record(&selected, "3B00", "reader", 10).unwrap();
+        store.stop("removed", Some(15)).unwrap();
+        store.archive_project(&selected).unwrap();
+        c.projects().unwrap();
+        assert_eq!(c.view.projects, ["zero sessions"]);
+        assert_eq!(c.view.project_seconds, 5);
+        store.unarchive_project(&selected).unwrap();
+        c.projects().unwrap();
+        assert_eq!(c.view.projects, [selected.clone(), "zero sessions".into()]);
+        assert!(c.worker.is_none());
+        store.archive_project(&selected).unwrap();
+        store.delete_project(&selected).unwrap();
+        c.view.settings.project.clear();
+        c.projects().unwrap();
+        assert_eq!(c.view.projects, ["zero sessions"]);
+        assert_eq!(c.view.project_seconds, 0);
     }
 
     #[test]

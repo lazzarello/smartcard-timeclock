@@ -111,8 +111,19 @@ command for arbitrary contact smartcards.
 
 - The default database is `timeclock.sqlite3` in the **current directory**. Use an
   absolute `--db` path consistently, especially with desktop launchers.
-- Only one watcher may use a database; reports remain available. Use a local
-  filesystem and leave its `.lock` file in place (a leftover file is normal).
+- Only one writer (watcher or project lifecycle operation) may use a database;
+  reports remain available. Use a local filesystem and leave its `.lock` file in
+  place (a leftover file is normal).
+- The first writable open upgrades older databases transactionally to a project
+  registry. Selected projects persist even without recorded time. Reports stay
+  read-only and can still read older databases. Older binaries must not write an
+  upgraded database.
+- The persistence API supports archiving, restoring, and permanently deleting
+  projects; user-facing controls are deferred. Archived projects cannot track
+  time and are excluded from the tray Projects menu, but their history stays in
+  reports. Only archived projects with no open session can be deleted; deletion
+  removes all their time records. A deleted name can be reused with no old history.
+  This is not secure erasure: backups and SQLite storage/WAL may retain old bytes.
 - Reports show cumulative time, insertion/session counts, and open sessions.
   Open time ends at the last checkpoint; `OPEN` does not prove a watcher is alive.
 - Timing uses whole-second wall-clock timestamps and roughly one-second
