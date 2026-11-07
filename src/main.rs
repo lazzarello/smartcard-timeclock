@@ -168,7 +168,22 @@ fn log_timestamp(timestamp: i64) -> Result<gtk4::glib::GString> {
     Ok(gtk4::glib::DateTime::from_unix_utc(timestamp)?.format_iso8601()?)
 }
 
-fn watcher_lock(path: &Path) -> Result<File> {
+struct DatabaseLock(File);
+
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        // Do not let a subprocess's inherited descriptor prolong the lock after shutdown.
+        let _ = self.0.unlock();
+    }
+}
+
+fn watcher_lock(path: &Path) -> Result<DatabaseLock> {
+    // Create only the file before locking; schema initialization must hold the lock.
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     let mut name = path.canonicalize()?.into_os_string();
     name.push(".lock");
     let file = OpenOptions::new()
@@ -179,7 +194,7 @@ fn watcher_lock(path: &Path) -> Result<File> {
         .open(name)?;
     file.try_lock()
         .context("Cannot lock database; another watcher may already be using it")?;
-    Ok(file)
+    Ok(DatabaseLock(file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +215,7 @@ fn watch(
 ) -> Result<()> {
     ensure!(!project.trim().is_empty(), "Project name cannot be blank");
     let mut store = store::Store::open(path).context("Cannot initialize SQLite database")?;
-    let _lock = watcher_lock(path)?;
+    store.create_project(project)?;
     let recovered = store.recover()?;
     if recovered > 0 {
         eprintln!(

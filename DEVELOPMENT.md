@@ -72,8 +72,11 @@ cargo build --locked --release --bin smartcard-timeclock
 The normal tests require no physical reader or desktop. They cover ATR parsing,
 reader selection, matching, session persistence/recovery, clock rollback, write
 contention, locking, reports, tray state, settings, and dialog lifecycle using
-fake observations and temporary databases. Watcher regression tests inject PC/SC
-results and elapsed/wall clocks: repeated context/reader outages, pinned identity,
+fake observations and temporary databases. Store regressions also cover v0→v1
+migration, rollback/reopen, exact names, schema-version rejection, foreign keys,
+archive/restore/delete, cascading rollback, name reuse, zero-session discovery,
+archived tracking rejection, writer-lock ordering, and read-only legacy queries.
+Watcher regression tests inject PC/SC results and elapsed/wall clocks: repeated context/reader outages, pinned identity,
 fresh recovery/card changes, absence before/after recovery, successful polls across
 suspend or write gaps, lock ownership, retry cancellation, and terminal storage
 failures. Three tests are ignored by default:
@@ -207,8 +210,8 @@ is maintained.
 
 - `src/main.rs`: clap commands, ATR parsing/formatting, PC/SC reader discovery and
   polling, watcher lock, shutdown signals, and the shared watcher.
-- `src/store.rs`: SQLite schema, transactional checkpoints, recovery, read-only
-  report queries, and report formatting.
+- `src/store.rs`: versioned SQLite schema/migration, project registry and lifecycle,
+  transactional checkpoints, recovery, read-only discovery/reports, and report formatting.
 - `src/tray.rs`: SNI/DBusMenu presentation, controller, worker ownership, and
   Zenity dialog lifecycle. It uses the same watcher/store as the CLI, not a
   separate timer.
@@ -265,8 +268,13 @@ reason. A partial unique index permits only one open session. Database constrain
 validate names, timestamp ordering, and end/reason consistency. Use parameterized
 SQL and keep transactions/error handling intact.
 
-A canonical-path `.lock` file permits one watcher per database while reports stay
-usable. Keep the lock for the watcher's lifetime and leave the lock file in place.
+A canonical-path `.lock` file permits one writer per database while reports stay
+usable. `Store::open` acquires it before SQLite initialization or migration and
+holds it for the connection's lifetime, including project lifecycle operations.
+Only the empty database file may be created before locking so its canonical path
+can be resolved. The connection closes before its lock guard explicitly unlocks,
+so a descriptor briefly inherited by a subprocess cannot prolong ownership.
+In-memory unit-test stores need no filesystem lock. Keep the lock file in place.
 Hard-linked database aliases or deleting a live lock file can defeat lock
 identity. Use a local filesystem. Do not change database paths implicitly or
 silently fall back to another file.
@@ -275,8 +283,40 @@ Reports are read-only: they do not create databases or recover sessions. An open
 session contributes only through its checkpoint; `OPEN` is not a liveness check.
 `SESSIONS` increases per insertion, not per heartbeat, and includes an open
 session. Removal does not complete/delete a project. Names are exact and
-case-sensitive, with spaces and Unicode preserved. There is no project registry,
-completion state, daemon, or automatic billing.
+case-sensitive, with spaces and Unicode preserved. There is no completion state,
+daemon, or automatic billing.
+
+`PRAGMA user_version = 0` denotes the legacy sessions-only schema; version 1 adds
+`projects(name TEXT PRIMARY KEY COLLATE BINARY, archived INTEGER DEFAULT 0)` with
+nonblank-name and boolean constraints. Each session references its project with
+`ON DELETE CASCADE`; writable connections enable foreign keys. Initialization
+backfills exact names, rebuilds sessions without changing IDs/metadata/timestamps,
+recreates the single-open-session index, checks foreign keys, and sets version 1
+in one transaction. Failure rolls back schema, data, and version. Migration does
+not recover sessions; watcher recovery remains separate. Unknown newer versions
+are rejected for writes before changing the journal mode. Do not use older
+binaries to write upgraded databases.
+
+`Store::create_project` registers/validates an active name without recording time;
+watcher startup calls it before recovery/hardware access. `record` also registers
+new names transactionally, rejects archived names, and cannot checkpoint a different
+project's open session. `archive_project`/`unarchive_project` retain history;
+`delete_project` requires an archived project and cascades to all its sessions.
+Lifecycle validation and mutation share a transaction, missing names fail explicitly,
+and a project's open session blocks lifecycle changes. Set-archive operations are
+idempotent; deletion is not. A deleted name may be created again with no history.
+Deletion is permanent in the application, not forensic secure erasure of backups or
+SQLite/WAL bytes. No archive timestamps or numeric project IDs are stored.
+
+`project_rows` is read-only and includes archived and zero-session projects; it
+also discovers legacy session names without migrating them. `report_rows` remains
+session-based and works on both schema versions: archived history is included,
+deleted history is absent, and zero-session projects add no rows. Both queries
+fail on a missing database without creating it or recovering open sessions.
+Archive/restore/delete controls and armed-watcher coordination are deferred to the
+UI stage of issue #5. Future controller mutations must stop/join the database's
+watcher before opening another writer, recheck tracking/stale actions, and not
+restart archived projects.
 
 Before removing a temporary test directory, inspect its **test** database with:
 
@@ -294,9 +334,11 @@ commit databases, WAL/SHM files, lock files, or private project history.
 
 Launch is idle: it does not create/recover a database or arm a project. Selecting
 a project automatically starts watching; a missing database is created then.
-Projects come from database history plus the currently selected name. Unrecorded
-names disappear when another name is selected; settings and selection are
-in-memory only.
+Projects come from the active-project registry plus an as-yet-unregistered
+selected name (legacy databases use distinct session names). Archived selections
+are never appended back into the menu. Watcher startup registers selected names,
+so projects with no sessions persist across selections/restarts. Settings and
+selection themselves remain in-memory only.
 
 The card alone controls tracking: no manual Start/Stop or Play/Pause controls.
 Project/settings actions are read-only during tracking, including submissions

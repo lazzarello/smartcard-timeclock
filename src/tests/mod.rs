@@ -98,7 +98,6 @@ fn recovery_repeated_context_loss_requires_fresh_observations_and_keeps_lock() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("clock.db");
     let mut store = store::Store::open(&db).unwrap();
-    let lock = watcher_lock(&db).unwrap();
     let running = AtomicBool::new(true);
     let mut input = FakeInput::new(&running);
     input.lock_path = Some(db.clone());
@@ -131,7 +130,7 @@ fn recovery_repeated_context_loss_requires_fresh_observations_and_keeps_lock() {
     let rows = store::report_rows(&db).unwrap();
     assert_eq!((rows[0].seconds, rows[0].sessions, rows[0].open), (4, 3, 0));
     assert!(watcher_lock(&db).is_err());
-    drop(lock);
+    drop(store);
     assert!(watcher_lock(&db).is_ok());
 }
 
@@ -334,7 +333,6 @@ fn cancellation_joins_a_retrying_watcher_and_releases_its_lock() {
     let (ready, wait) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let mut store = store::Store::open(&path).unwrap();
-        let _lock = watcher_lock(&path).unwrap();
         store.record("work", "3B00", "pinned", 10).unwrap();
         store.record("work", "3B00", "pinned", 12).unwrap();
         monitor_input(
@@ -505,8 +503,11 @@ fn watcher_lock_is_exclusive_and_released_on_drop() {
     File::create(&db).unwrap();
     let lock = watcher_lock(&db).unwrap();
     assert!(watcher_lock(&dir.join(".").join("test.sqlite3")).is_err());
+    // A duplicate models a descriptor briefly inherited by a concurrent subprocess launch.
+    let inherited = lock.0.try_clone().unwrap();
     drop(lock);
     drop(watcher_lock(&db).unwrap());
+    drop(inherited);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -515,6 +516,34 @@ fn tray_launch_does_not_offer_keyboard_controls() {
     let cli = Cli::try_parse_from(["timeclock", "tray"]).unwrap();
     assert!(matches!(cli.command, Command::Tray { .. }));
     assert!(Cli::try_parse_from(["timeclock", "tray", "--controls"]).is_err());
+}
+
+#[test]
+fn watch_rejects_archived_projects_before_recovery_or_hardware_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("clock.db");
+    let mut store = store::Store::open(&db).unwrap();
+    store.create_project("archived").unwrap();
+    store.archive_project("archived").unwrap();
+    store.record("work", "3B00", "pinned", 10).unwrap();
+    store.record("work", "3B00", "pinned", 12).unwrap();
+    drop(store);
+    let error = watch(
+        &db,
+        "archived",
+        None,
+        &[0x3b, 0],
+        &AtomicBool::new(true),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("is archived"));
+    let rows = store::report_rows(&db).unwrap();
+    assert_eq!(
+        (rows[0].project.as_str(), rows[0].seconds, rows[0].open),
+        ("work", 2, 1)
+    );
+    assert!(store::Store::open(&db).is_ok());
 }
 
 #[test]
