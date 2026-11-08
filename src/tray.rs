@@ -1,4 +1,5 @@
 //! Standard SNI/DBusMenu adapter; the only tracker is `watch` in main.rs.
+mod reports;
 use super::*;
 use gtk4::{gio, glib, prelude::*};
 use ksni::{
@@ -6,6 +7,7 @@ use ksni::{
     blocking::TrayMethods,
     menu::{StandardItem, SubMenu},
 };
+use reports::{ProjectSummary, ProjectTarget, ReportsWindow};
 use std::{
     cell::Cell,
     io::{Read, Write},
@@ -97,7 +99,40 @@ enum Action {
     Scan,
     Status,
     Report,
+    Archive(ProjectTarget, bool),
+    RequestDelete(ProjectTarget),
+    DeleteResponse(ProjectTarget, bool),
+    CancelDelete,
     Quit,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectChange {
+    Archive(bool),
+    Delete,
+}
+
+fn project_summaries(path: &Path) -> Result<Vec<ProjectSummary>> {
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let totals: std::collections::HashMap<_, _> = store::report_rows(path)?
+        .into_iter()
+        .map(|row| (row.project.clone(), row))
+        .collect();
+    Ok(store::project_rows(path)?
+        .into_iter()
+        .map(|project| {
+            let total = totals.get(&project.name);
+            ProjectSummary {
+                project: project.name,
+                archived: project.archived,
+                seconds: total.map_or(0, |row| row.seconds),
+                sessions: total.map_or(0, |row| row.sessions),
+                open: total.map_or(0, |row| row.open),
+            }
+        })
+        .collect())
 }
 
 #[derive(Clone)]
@@ -220,7 +255,7 @@ impl ksni::Tray for Tray {
             .into(),
             MenuItem::Separator,
             self.item("Scan readers…", Action::Scan, !self.dialog_open),
-            self.item("Report…", Action::Report, !self.dialog_open),
+            self.item("Report…", Action::Report, true),
             SubMenu {
                 label: "Settings".into(),
                 enabled: self.editable(),
@@ -415,10 +450,21 @@ async fn follow_system_theme() {
     std::future::pending::<()>().await;
 }
 
+fn compact_header() -> gtk4::HeaderBar {
+    let titlebar = gtk4::HeaderBar::new();
+    titlebar.add_css_class("default-decoration");
+    let style = gtk4::CssProvider::new();
+    // Match the status window's 35-logical-pixel minimum, allowing larger fonts.
+    style.load_from_data("headerbar { min-height: 34px; padding-top: 0; padding-bottom: 0; }");
+    titlebar
+        .style_context()
+        .add_provider(&style, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    titlebar
+}
+
 struct StatusWindow {
     window: gtk4::Window,
     label: gtk4::Label,
-    theme: glib::JoinHandle<()>,
 }
 impl StatusWindow {
     fn new(view: &Tray) -> Result<Self> {
@@ -431,14 +477,7 @@ impl StatusWindow {
             .margin_start(16)
             .margin_end(16)
             .build();
-        let titlebar = gtk4::HeaderBar::new();
-        titlebar.add_css_class("default-decoration");
-        let style = gtk4::CssProvider::new();
-        // Alacritty's Wayland title bar is 35 logical pixels, including the bottom border.
-        style.load_from_data("headerbar { min-height: 34px; padding-top: 0; padding-bottom: 0; }");
-        titlebar
-            .style_context()
-            .add_provider(&style, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let titlebar = compact_header();
         let window = gtk4::Window::builder()
             .title("Timeclock status")
             .resizable(false)
@@ -446,12 +485,7 @@ impl StatusWindow {
             .child(&label)
             .build();
         window.set_titlebar(Some(&titlebar));
-        let theme = glib::spawn_future_local(follow_system_theme());
-        Ok(Self {
-            window,
-            label,
-            theme,
-        })
+        Ok(Self { window, label })
     }
     fn update(&self, view: &Tray) {
         let text = view.status_text();
@@ -462,7 +496,6 @@ impl StatusWindow {
 }
 impl Drop for StatusWindow {
     fn drop(&mut self) {
-        self.theme.abort();
         self.window.destroy();
     }
 }
@@ -473,6 +506,11 @@ struct Controller {
     spawn_worker: fn(Settings) -> Worker,
     dialog: Option<Dialog>,
     status_window: Option<StatusWindow>,
+    reports_window: Option<ReportsWindow>,
+    project_rows: Vec<ProjectSummary>,
+    project_revision: u64,
+    pending_delete: Option<ProjectTarget>,
+    theme: Option<glib::JoinHandle<()>>,
 }
 impl Controller {
     fn stop(&mut self) -> Result<()> {
@@ -495,31 +533,97 @@ impl Controller {
         Ok(())
     }
     fn projects(&mut self) -> Result<()> {
-        let rows = if self.view.settings.db.try_exists()? {
-            store::report_rows(&self.view.settings.db)?
-        } else {
-            Vec::new()
-        };
+        let rows = project_summaries(&self.view.settings.db)?;
         self.view.project_seconds = rows
             .iter()
             .find(|row| row.project == self.view.settings.project)
             .map_or(0, |row| row.seconds);
-        let projects = if self.view.settings.db.try_exists()? {
-            store::project_rows(&self.view.settings.db)?
-        } else {
-            Vec::new()
-        };
-        self.view.projects = projects
+        self.view.projects = rows
             .iter()
-            .filter(|project| !project.archived)
-            .map(|project| project.name.clone())
+            .filter(|row| !row.archived)
+            .map(|row| row.project.clone())
             .collect();
         if !self.view.settings.project.is_empty()
-            && !projects
+            && !rows
                 .iter()
-                .any(|project| project.name == self.view.settings.project)
+                .any(|row| row.project == self.view.settings.project)
         {
             self.view.projects.push(self.view.settings.project.clone());
+        }
+        self.project_rows = rows;
+        self.update_reports();
+        Ok(())
+    }
+    fn ensure_theme(&mut self) {
+        if self.theme.is_none() {
+            self.theme = Some(glib::spawn_future_local(follow_system_theme()));
+        }
+    }
+    fn update_reports(&mut self) {
+        if let Some(reports) = &mut self.reports_window {
+            reports.update(&self.view, self.project_revision, &self.project_rows);
+        }
+    }
+    fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+        if let Some(reports) = &mut self.reports_window {
+            reports.close_confirmation();
+        }
+    }
+    fn validate_target(&self, target: &ProjectTarget) -> Result<()> {
+        ensure!(
+            target.db == self.view.settings.db && target.revision == self.project_revision,
+            "Project list changed; review the current reports and try again"
+        );
+        ensure!(
+            self.view.editable(),
+            "Remove the target card before changing projects"
+        );
+        Ok(())
+    }
+    fn change_project(&mut self, target: ProjectTarget, change: ProjectChange) -> Result<()> {
+        self.poll_worker()?;
+        self.validate_target(&target)?;
+        self.projects()?;
+        ensure!(
+            self.project_rows
+                .iter()
+                .any(|row| row.project == target.project),
+            "Project no longer exists"
+        );
+        // Drain without another database read: validation may have blocked while the card changed.
+        self.poll_worker_events()?;
+        self.validate_target(&target)?;
+        let restart = self.worker.is_some();
+        self.stop()?;
+        let result = (|| -> Result<()> {
+            ensure!(
+                target.db.try_exists()?,
+                "Selected database no longer exists"
+            );
+            let mut store = store::Store::open(&target.db)?;
+            match change {
+                ProjectChange::Archive(true) => store.archive_project(&target.project)?,
+                ProjectChange::Archive(false) => store.unarchive_project(&target.project)?,
+                ProjectChange::Delete => store.delete_project(&target.project)?,
+            }
+            Ok(())
+        })();
+        // A failed write leaves the selection intact, but never claims its stopped watcher is live.
+        result.context("Cannot change project; watcher stopped, reselect the project to retry")?;
+        self.project_revision += 1;
+        self.cancel_delete();
+        if target.project == self.view.settings.project
+            && matches!(change, ProjectChange::Archive(true) | ProjectChange::Delete)
+        {
+            self.view.settings.project.clear();
+            self.view.project_seconds = 0;
+        } else if restart {
+            self.start_watching()?;
+        }
+        self.projects()?;
+        if let Some(reports) = &self.reports_window {
+            reports.show_error("");
         }
         Ok(())
     }
@@ -533,6 +637,14 @@ impl Controller {
         match entry {
             Entry::Project => {
                 ensure!(!text.trim().is_empty(), "Project name cannot be blank");
+                if settings.db.try_exists()? {
+                    ensure!(
+                        !store::project_rows(&settings.db)?
+                            .iter()
+                            .any(|row| row.name == text && row.archived),
+                        "Project is archived; restore it in Reports before tracking"
+                    );
+                }
                 settings.project = text;
             }
             Entry::Database => {
@@ -540,6 +652,12 @@ impl Controller {
                 settings.db = std::path::absolute(text)?;
                 if settings.db.try_exists()? {
                     store::report_rows(&settings.db).context("Cannot use selected database")?;
+                    if store::project_rows(&settings.db)?
+                        .iter()
+                        .any(|row| row.name == settings.project && row.archived)
+                    {
+                        settings.project.clear();
+                    }
                 } else {
                     ensure!(
                         settings.db.parent().is_some_and(Path::is_dir),
@@ -551,14 +669,20 @@ impl Controller {
             Entry::Atr => settings.atr = parse_atr(&text).map_err(anyhow::Error::msg)?,
         }
         // Validation may block on SQLite; recheck events before changing a live project.
-        self.poll_worker()?;
+        self.poll_worker_events()?;
         ensure!(
             self.view.editable(),
             "Remove the target card before changing the project or settings"
         );
         self.stop()?;
+        if settings.db != self.view.settings.db {
+            self.project_revision += 1;
+            self.cancel_delete();
+            self.project_rows.clear();
+        }
         self.view.settings = settings;
         self.view.project_seconds = 0;
+        self.update_reports();
         self.projects()?;
         if !self.view.settings.project.is_empty() {
             self.start_watching()?;
@@ -573,6 +697,7 @@ impl Controller {
                 if self.status_window.is_none() {
                     self.status_window = Some(StatusWindow::new(&self.view)?);
                 }
+                self.ensure_theme();
                 let status = self.status_window.as_ref().unwrap();
                 status.update(&self.view);
                 status.window.present();
@@ -605,22 +730,51 @@ impl Controller {
             Action::Scan if self.dialog.is_none() => {
                 self.dialog = Some(Dialog::spawn(None, "PC/SC readers", scan_text()?)?);
             }
-            Action::Report if self.dialog.is_none() => {
-                let rows = store::report_rows(&self.view.settings.db).context(
-                    "Cannot read selected database; record a session first or check the path",
-                )?;
-                self.dialog = Some(Dialog::spawn(
-                    None,
-                    "Project totals (open time through last checkpoint)",
-                    store::report_text(&rows),
-                )?);
+            Action::Report => {
+                if self.reports_window.is_none() {
+                    self.reports_window = Some(ReportsWindow::new(self.view.tx.clone())?);
+                }
+                self.ensure_theme();
+                self.reports_window.as_ref().unwrap().window.present();
                 self.projects()?;
             }
+            Action::Archive(target, archived) => {
+                self.change_project(target, ProjectChange::Archive(archived))?;
+            }
+            Action::RequestDelete(target) => {
+                self.validate_target(&target)?;
+                self.projects()?;
+                self.poll_worker_events()?;
+                self.validate_target(&target)?;
+                let row = self
+                    .project_rows
+                    .iter()
+                    .find(|row| row.project == target.project)
+                    .context("Project no longer exists")?;
+                ensure!(row.archived, "Archive this project before deleting it");
+                let reports = self
+                    .reports_window
+                    .as_mut()
+                    .context("Open Reports before deleting a project")?;
+                reports.confirm_delete(target.clone(), row, self.view.tx.clone());
+                self.pending_delete = Some(target);
+            }
+            Action::DeleteResponse(target, accepted) => {
+                ensure!(
+                    self.pending_delete.as_ref() == Some(&target),
+                    "Deletion confirmation expired"
+                );
+                self.cancel_delete();
+                if accepted {
+                    self.change_project(target, ProjectChange::Delete)?;
+                }
+            }
+            Action::CancelDelete => self.cancel_delete(),
             _ => {}
         }
         Ok(())
     }
-    fn poll_worker(&mut self) -> Result<()> {
+    fn poll_worker_events(&mut self) -> Result<bool> {
         let mut updated = false;
         if let Some(worker) = &self.worker {
             for state in worker.events.try_iter() {
@@ -632,7 +786,10 @@ impl Controller {
                 updated = true;
             }
         }
-        if updated {
+        Ok(updated)
+    }
+    fn poll_worker(&mut self) -> Result<()> {
+        if self.poll_worker_events()? {
             self.projects().context("Cannot refresh project time")?;
         }
         Ok(())
@@ -641,6 +798,9 @@ impl Controller {
         self.poll_worker()?;
         if let Some(status) = &self.status_window {
             status.update(&self.view);
+        }
+        self.update_reports();
+        if self.status_window.is_some() || self.reports_window.is_some() {
             let context = gtk4::glib::MainContext::default();
             while context.pending() {
                 context.iteration(false);
@@ -664,6 +824,9 @@ impl Controller {
     fn error(&mut self, error: anyhow::Error) {
         let text = format!("{error:#}");
         eprintln!("{text}");
+        if let Some(reports) = &self.reports_window {
+            reports.show_error(&text);
+        }
         if self.worker.is_none() {
             self.view.status = Status::Error(text);
         }
@@ -671,6 +834,10 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
+        if let Some(theme) = self.theme.take() {
+            theme.abort();
+        }
+        self.reports_window.take();
         self.status_window.take();
         self.dialog.take();
         if let Err(error) = self.stop() {
@@ -703,6 +870,11 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
         spawn_worker: Worker::watch,
         dialog: None,
         status_window: None,
+        reports_window: None,
+        project_rows: Vec::new(),
+        project_revision: 0,
+        pending_delete: None,
+        theme: None,
     };
     if let Err(error) = controller.projects() {
         controller.error(error);
@@ -735,7 +907,7 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn controller(db: PathBuf) -> Controller {
+    pub(super) fn controller(db: PathBuf) -> Controller {
         let (tx, _) = mpsc::channel();
         Controller {
             view: Tray {
@@ -763,6 +935,11 @@ mod tests {
             },
             dialog: None,
             status_window: None,
+            reports_window: None,
+            project_rows: Vec::new(),
+            project_revision: 0,
+            pending_delete: None,
+            theme: None,
         }
     }
 
@@ -1136,6 +1313,202 @@ mod tests {
         assert_eq!(c.view.status, Status::Idle);
     }
 
+    fn target(c: &Controller, project: &str) -> ProjectTarget {
+        ProjectTarget {
+            db: c.view.settings.db.clone(),
+            revision: c.project_revision,
+            project: project.into(),
+        }
+    }
+
+    #[test]
+    fn overview_includes_archived_and_empty_projects_but_menu_excludes_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("projects.db");
+        let mut store = store::Store::open(&db).unwrap();
+        let name = "  client_项目 '<&>  ";
+        store.record(name, "3B00", "fake", 10).unwrap();
+        store.stop("removed", Some(15)).unwrap();
+        store.archive_project(name).unwrap();
+        store.create_project("empty").unwrap();
+        drop(store);
+        let mut c = controller(db);
+        // A stale selected name must not leak an archived project back into the menu.
+        c.view.settings.project = name.into();
+        c.projects().unwrap();
+        assert_eq!(c.project_rows.len(), 2);
+        assert_eq!(
+            c.project_rows[0],
+            ProjectSummary {
+                project: name.into(),
+                seconds: 5,
+                sessions: 1,
+                open: 0,
+                archived: true,
+            }
+        );
+        assert_eq!(c.project_rows[1].project, "empty");
+        assert_eq!(c.project_rows[1].sessions, 0);
+        assert_eq!(c.view.projects, ["empty"]);
+        assert!(c.worker.is_none());
+        assert!(c.apply(Entry::Project, name.into()).is_err());
+    }
+
+    #[test]
+    fn archive_selected_disarms_and_restore_only_readds_to_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("archive.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.record("work", "3B00", "fake", 10).unwrap();
+        store.stop("removed", Some(15)).unwrap();
+        drop(store);
+        let mut c = controller(db.clone());
+        c.view.settings.project = "work".into();
+        c.start_watching().unwrap();
+        c.action(Action::Archive(target(&c, "work"), true)).unwrap();
+        assert!(c.worker.is_none());
+        assert!(c.view.settings.project.is_empty());
+        assert_eq!(c.view.status, Status::Idle);
+        assert!(c.view.projects.is_empty());
+        assert!(c.project_rows[0].archived);
+        assert_eq!(c.project_rows[0].seconds, 5);
+        c.action(Action::Archive(target(&c, "work"), false))
+            .unwrap();
+        assert_eq!(c.view.projects, ["work"]);
+        assert!(c.worker.is_none());
+        assert!(c.view.settings.project.is_empty());
+        assert_eq!(store::report_rows(&db).unwrap()[0].seconds, 5);
+    }
+
+    #[test]
+    fn unrelated_mutation_joins_then_rearms_existing_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("archive.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.create_project("other").unwrap();
+        drop(store);
+        let mut c = controller(db);
+        c.start_watching().unwrap();
+        let old_worker = c.worker.as_ref().unwrap().thread.thread().id();
+        c.action(Action::Archive(target(&c, "other"), true))
+            .unwrap();
+        assert_ne!(old_worker, c.worker.as_ref().unwrap().thread.thread().id());
+        assert_eq!(c.view.settings.project, "old_project <&>");
+        assert_eq!(c.view.status, Status::Watching(WatchState::Waiting));
+        assert!(!c.view.projects.contains(&"other".into()));
+    }
+
+    #[test]
+    fn delete_requires_confirmation_and_archive_and_cancel_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("delete.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.record("work", "3B00", "fake", 10).unwrap();
+        store.stop("removed", Some(15)).unwrap();
+        drop(store);
+        let mut c = controller(db.clone());
+        let work = target(&c, "work");
+        assert!(c.action(Action::RequestDelete(work.clone())).is_err());
+        assert!(
+            c.action(Action::DeleteResponse(work.clone(), true))
+                .is_err()
+        );
+        // Even a forged confirmation cannot bypass the store's archive requirement.
+        c.pending_delete = Some(work.clone());
+        assert!(
+            c.action(Action::DeleteResponse(work.clone(), true))
+                .is_err()
+        );
+        assert_eq!(store::report_rows(&db).unwrap()[0].seconds, 5);
+        c.action(Action::Archive(work, true)).unwrap();
+        let work = target(&c, "work");
+        c.pending_delete = Some(work.clone());
+        c.action(Action::DeleteResponse(work.clone(), false))
+            .unwrap();
+        assert!(c.pending_delete.is_none());
+        assert_eq!(store::report_rows(&db).unwrap()[0].seconds, 5);
+        c.pending_delete = Some(work.clone());
+        c.action(Action::DeleteResponse(work, true)).unwrap();
+        assert!(store::project_rows(&db).unwrap().is_empty());
+        assert!(store::report_rows(&db).unwrap().is_empty());
+        assert!(c.project_rows.is_empty());
+    }
+
+    #[test]
+    fn tracking_rejects_archive_and_preexisting_delete_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("tracking.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.create_project("work").unwrap();
+        store.archive_project("work").unwrap();
+        drop(store);
+        let mut c = controller(db.clone());
+        let work = target(&c, "work");
+        c.pending_delete = Some(work.clone());
+        let (ready, wait) = mpsc::channel();
+        c.worker = Some(Worker::spawn(move |running, tx| {
+            tx.send(WatchState::Tracking)?;
+            ready.send(())?;
+            while running.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }));
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        let worker = c.worker.as_ref().unwrap().thread.thread().id();
+        assert!(c.action(Action::Archive(work.clone(), false)).is_err());
+        assert!(c.action(Action::DeleteResponse(work, true)).is_err());
+        assert_eq!(worker, c.worker.as_ref().unwrap().thread.thread().id());
+        assert!(store::project_rows(&db).unwrap()[0].archived);
+    }
+
+    #[test]
+    fn database_switch_and_lifecycle_changes_invalidate_old_report_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("first.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.create_project("work").unwrap();
+        store.archive_project("work").unwrap();
+        drop(store);
+        let mut c = controller(db.clone());
+        c.view.settings.project.clear();
+        let old = target(&c, "work");
+        c.pending_delete = Some(old.clone());
+        c.action(Action::Archive(old.clone(), false)).unwrap();
+        assert!(c.pending_delete.is_none());
+        assert!(c.action(Action::Archive(old.clone(), true)).is_err());
+        assert!(c.action(Action::DeleteResponse(old, true)).is_err());
+        let old = target(&c, "work");
+        let other = dir.path().join("second.db");
+        c.apply(Entry::Database, other.to_str().unwrap().into())
+            .unwrap();
+        c.apply(Entry::Database, db.to_str().unwrap().into())
+            .unwrap();
+        assert!(c.action(Action::Archive(old, true)).is_err());
+        assert!(!store::project_rows(&db).unwrap()[0].archived);
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn failed_archive_preserves_saved_state_and_does_not_recover_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("failure.db");
+        let mut store = store::Store::open(&db).unwrap();
+        store.record("work", "3B00", "fake", 10).unwrap();
+        store.record("work", "3B00", "fake", 15).unwrap();
+        let mut c = controller(db.clone());
+        c.view.settings.project = "work".into();
+        // A different writer owns the lock: no lifecycle change is allowed.
+        assert!(c.action(Action::Archive(target(&c, "work"), true)).is_err());
+        drop(store);
+        // A stale open session must not be recovered implicitly by Reports either.
+        assert!(c.action(Action::Archive(target(&c, "work"), true)).is_err());
+        assert_eq!(c.view.settings.project, "work");
+        assert!(!store::project_rows(&db).unwrap()[0].archived);
+        let row = store::report_rows(&db).unwrap().remove(0);
+        assert_eq!((row.seconds, row.open), (5, 1));
+    }
+
     fn fake_dialog(script: &str) -> Dialog {
         let mut command = ProcessCommand::new("sh");
         command.args(["-c", script]);
@@ -1164,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires GTK4, Zenity and a graphical session; briefly opens status/report windows"]
+    #[ignore = "requires GTK4 and a graphical session; briefly opens status/report windows"]
     fn status_and_report_without_card_or_active_project_opens_and_preserves_history() {
         for has_history in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1237,20 +1610,18 @@ mod tests {
             c.view.settings.project.clear();
             c.view.status = Status::Idle;
             c.action(Action::Report).unwrap();
-            let dialog_id = c.dialog.as_ref().unwrap().child.id();
+            let reports = c.reports_window.as_ref().unwrap().window.clone();
             c.action(Action::Report).unwrap();
-            assert_eq!(c.dialog.as_ref().unwrap().child.id(), dialog_id);
-            // Poll the real process so unsupported Zenity options cannot pass as a successful spawn.
-            for _ in 0..100 {
-                thread::sleep(Duration::from_millis(5));
-                c.poll().unwrap();
-                assert!(c.dialog.is_some(), "Report dialog exited unexpectedly");
-            }
+            assert_eq!(c.reports_window.as_ref().unwrap().window, reports);
+            assert!(c.dialog.is_none());
+            c.poll().unwrap();
+            assert!(reports.is_visible());
             assert!(c.worker.is_none());
             assert!(c.view.settings.project.is_empty());
             assert_eq!(c.view.status, Status::Idle);
             drop(c);
             assert!(!window.is_visible());
+            assert!(!reports.is_visible());
             assert_eq!(
                 store::report_text(&store::report_rows(&db).unwrap()),
                 before
