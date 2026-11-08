@@ -80,13 +80,10 @@ impl Store {
         Ok(())
     }
 
-    // These lifecycle operations are consumed by the next, UI stage of issue #5.
-    #[allow(dead_code, reason = "archive controls are deferred to the UI stage")]
     pub fn archive_project(&mut self, project: &str) -> Result<()> {
         self.set_archived(project, true)
     }
 
-    #[allow(dead_code, reason = "archive controls are deferred to the UI stage")]
     pub fn unarchive_project(&mut self, project: &str) -> Result<()> {
         self.set_archived(project, false)
     }
@@ -104,7 +101,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "delete controls are deferred to the UI stage")]
     pub fn delete_project(&mut self, project: &str) -> Result<()> {
         let tx = self
             .0

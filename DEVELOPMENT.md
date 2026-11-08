@@ -8,7 +8,8 @@ Agent-specific instructions live in [AGENTS.md](AGENTS.md).
 Use Rust **1.89+**, Cargo, rustfmt, Clippy, pkg-config, and the PC/SC and SQLite
 headers/libraries, plus GTK4 development libraries for the tray status window.
 The CLI needs no display (GTK is initialized only when opening the status window).
-Tray dialogs additionally need Zenity and a graphical session with a session DBus
+Tray settings and reader-scan dialogs additionally need Zenity. GTK4 status/reports
+windows and tray dialogs need a graphical session; the tray needs a session DBus
 and StatusNotifierItem/DBusMenu host.
 
 The existing Nix environment supplies Rust and the native/development tools:
@@ -76,23 +77,36 @@ fake observations and temporary databases. Store regressions also cover v0→v1
 migration, rollback/reopen, exact names, schema-version rejection, foreign keys,
 archive/restore/delete, cascading rollback, name reuse, zero-session discovery,
 archived tracking rejection, writer-lock ordering, and read-only legacy queries.
-Watcher regression tests inject PC/SC results and elapsed/wall clocks: repeated context/reader outages, pinned identity,
+Project-management tests cover archived menu filtering, disarming/rearming,
+deletion confirmation, stale database/revision targets, tracking guards, and
+failed writes without recovery. Watcher regression tests inject PC/SC results
+and elapsed/wall clocks: repeated context/reader outages, pinned identity,
 fresh recovery/card changes, absence before/after recovery, successful polls across
 suspend or write gaps, lock ownership, retry cancellation, and terminal storage
-failures. Three tests are ignored by default:
+failures. Four tests are ignored by default:
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
   real SNI/DBusMenu protocols, including idle menu requests that must not open
   app windows, arm a watcher, or create a database. **Never run it on the desktop
   session bus.** The command above provides an isolated bus and requires
   `dbus-run-session`, `dbus-send`, and `timeout`.
-- `status_and_report_without_card_or_active_project…` opens a real GTK4 status
-  window and Zenity report dialogs. It checks live text, literal project names,
+- `status_and_report_without_card_or_active_project…` opens real GTK4 status
+  and reports windows. It checks live text, literal project names,
   singleton/reopen behavior, and unchanged report history. Run it separately in a
   graphical session:
 
   ```sh
   cargo test --locked status_and_report_without_card_or_active_project -- --ignored
+  ```
+
+- `reports_archive_restore_delete_and_independent_window_lifecycle` opens the
+  real GTK4 overview without first opening Status. It checks missing-database
+  reads, singleton/reopen behavior, literal names, archive/restore and failed-write
+  checkbox state, tracking sensitivity, cancellation, and confirmed deletion.
+  Run it separately in a graphical session, using only its temporary database:
+
+  ```sh
+  cargo test --locked reports_archive_restore_delete_and_independent_window_lifecycle -- --ignored
   ```
 
 - `isolated_theme…` registers a fake desktop settings portal and checks initial
@@ -173,7 +187,7 @@ The only prebuilt target is Linux x86-64, dynamically linked against Debian 12
 libraries (glibc 2.36 baseline, PC/SC, SQLite, GTK4). Newer compatible distributions
 need those runtime libraries; NixOS uses a source build. Tray compatibility is
 protocol-based, not distribution-based: `ksni` requires an SNI/DBusMenu host on
-the session bus, with GTK4 for status and Zenity for dialogs. CI's headless test
+the session bus, with GTK4 for status/reports and Zenity for settings/reader scanning. CI's headless test
 does not certify any particular desktop.
 
 #### Publish a release
@@ -213,8 +227,9 @@ is maintained.
 - `src/store.rs`: versioned SQLite schema/migration, project registry and lifecycle,
   transactional checkpoints, recovery, read-only discovery/reports, and report formatting.
 - `src/tray.rs`: SNI/DBusMenu presentation, controller, worker ownership, and
-  Zenity dialog lifecycle. It uses the same watcher/store as the CLI, not a
-  separate timer.
+  Zenity dialog lifecycle. `src/tray/reports.rs` owns the GTK4 project overview
+  and delete confirmation widgets; callbacks send actions to the same controller.
+  It uses the same watcher/store as the CLI, not a separate timer.
 - `src/tests/mod.rs`: CLI/watcher unit tests and fake observations, loaded by
   `#[cfg(test)] mod tests;` in `src/main.rs`. Store and tray unit tests remain
   inline under `#[cfg(test)]` in their implementation modules.
@@ -279,12 +294,14 @@ Hard-linked database aliases or deleting a live lock file can defeat lock
 identity. Use a local filesystem. Do not change database paths implicitly or
 silently fall back to another file.
 
-Reports are read-only: they do not create databases or recover sessions. An open
+CLI reports and overview reads are read-only: they do not create databases or
+recover sessions. Only explicit project lifecycle actions write from Reports. An open
 session contributes only through its checkpoint; `OPEN` is not a liveness check.
 `SESSIONS` increases per insertion, not per heartbeat, and includes an open
 session. Removal does not complete/delete a project. Names are exact and
-case-sensitive, with spaces and Unicode preserved. There is no completion state,
-daemon, or automatic billing.
+case-sensitive, with spaces and Unicode preserved. Archived projects retain their
+history in reports; permanently deleting a project removes its sessions as well.
+There is no completion state, daemon, or automatic billing.
 
 `PRAGMA user_version = 0` denotes the legacy sessions-only schema; version 1 adds
 `projects(name TEXT PRIMARY KEY COLLATE BINARY, archived INTEGER DEFAULT 0)` with
@@ -313,10 +330,8 @@ also discovers legacy session names without migrating them. `report_rows` remain
 session-based and works on both schema versions: archived history is included,
 deleted history is absent, and zero-session projects add no rows. Both queries
 fail on a missing database without creating it or recovering open sessions.
-Archive/restore/delete controls and armed-watcher coordination are deferred to the
-UI stage of issue #5. Future controller mutations must stop/join the database's
-watcher before opening another writer, recheck tracking/stale actions, and not
-restart archived projects.
+Controller mutations stop/join the database's watcher before opening another
+writer, recheck tracking/stale actions, and never restart archived projects.
 
 Before removing a temporary test directory, inspect its **test** database with:
 
@@ -332,13 +347,37 @@ commit databases, WAL/SHM files, lock files, or private project history.
 
 ### Tray and dialogs
 
+The GTK4 Reports window is independent of Status and reuses its compact header
+and desktop theme behavior. One controller-owned theme subscription serves both
+windows, including when hidden. GTK events are serviced when either window exists.
+Reports reads every registered project, joining read-only totals with zero-session
+and archived rows. Only active projects populate the tray Projects menu; a stale
+selected name must not reintroduce an archived project.
+
+Archive changes apply once, with checkbox state reflecting committed data only.
+Lifecycle actions recheck queued worker observations after blocking validation,
+join the existing watcher before acquiring the writer store, and retain database
+path/revision targets to reject stale actions. Archiving the selected project clears
+selection and leaves Idle; unrelated changes rearm a previously armed watcher after
+releasing the store lock. A failed write leaves the selection intact but stops the
+watcher honestly. No lifecycle action implicitly recovers stale open sessions.
+
+Delete is available only for archived rows and requires a parented, modal GTK4
+confirmation with literal name, session count, total, Cancel as default, and a
+separately labeled destructive action. Cancel does not stop the watcher or mutate
+data. Switching databases cancels confirmation and invalidates queued report
+actions, including after switching away and back to the same path. Closing Reports
+cancels confirmation but does not stop tracking. Quit destroys both GTK windows.
+
 Launch is idle: it does not create/recover a database or arm a project. Selecting
 a project automatically starts watching; a missing database is created then.
 Projects come from the active-project registry plus an as-yet-unregistered
 selected name (legacy databases use distinct session names). Archived selections
 are never appended back into the menu. Watcher startup registers selected names,
 so projects with no sessions persist across selections/restarts. Settings and
-selection themselves remain in-memory only.
+selection themselves remain in-memory only. Archived names cannot be selected or
+implicitly restored. Changing to a database where the selected name is archived
+clears selection.
 
 The card alone controls tracking: no manual Start/Stop or Play/Pause controls.
 Project/settings actions are read-only during tracking, including submissions
@@ -363,7 +402,8 @@ Its light/dark appearance follows
 `org.freedesktop.portal.Settings`'s `org.freedesktop.appearance/color-scheme`, read
 asynchronously and monitored via `SettingChanged`. No preference or an unavailable
 portal preserves the configured GTK theme; no shell settings are changed. The
-subscription and pending read are cancelled when the window is destroyed. GTK
+subscription and pending read are shared by both windows and cancelled on controller
+shutdown. GTK
 events are serviced by the tray controller; there is no separate timer. Reports and reader scanning remain
 available while tracking. The selected project's total includes all persisted
 sessions/checkpoints and excludes pauses; titles and tooltips reflect the same
@@ -375,7 +415,7 @@ discards its queued events. After fixing a terminal watcher error, reselecting t
 project retries.
 
 Every Zenity child and pipe thread is owned and reaped on completion, Quit,
-Ctrl-C, or SIGTERM. Closing a report early may break its input pipe without making
+Ctrl-C, or SIGTERM. Closing scan output early may break its input pipe without making
 shutdown fail. Preserve literal names and escape menu underscores. Do not install
 DMS plugins, autostart entries, or desktop configuration as a side effect.
 
@@ -430,7 +470,11 @@ rm -r -- "$test_dir"
    against Alacritty at the same display scale; verify dragging, the close button,
    and unclipped text at larger accessibility font sizes. No toolbar clock should appear.
    Open **Report…**
-   from the right-click menu; repeated requests must not duplicate that dialog.
+   from the right-click menu before opening Status as well as afterward; repeated
+   requests must raise the same GTK4 overview. Check resize/scroll behavior, literal
+   long/Unicode project names, keyboard focus, and screen-reader labels for each
+   Archived checkbox and Delete button. Totals-only updates must preserve focus.
+   Missing databases must show an empty state without creating a file.
 2. Scan readers; set the exact reader and ATR. Enter/select projects with spaces,
    underscores, and Unicode. Selection must automatically arm the watcher.
 3. Keep the status window open. Without a card: waiting for card, project, and
@@ -445,7 +489,17 @@ rm -r -- "$test_dir"
    settings OK closes the dialog and applies once. Change databases: no further
    writes to the old path. Invalid paths/missing readers must show errors, not
    tracking or fallback. With no selected project, settings must leave the tray idle.
-6. While tray watching is active, start a second CLI watcher against **only this
+6. In Reports, archive a project: its row/history stays visible but its tray menu
+   entry disappears. Restore it: the entry returns without starting its watcher.
+   Archive the selected, paused project: selection clears and reinsertion must not
+   restart it. Confirm that all lifecycle controls disable while tracking, including
+   a delete confirmation opened before insertion. Delete requires archive first;
+   verify Cancel/Escape/window close change nothing, then confirm deletion and check
+   both registry and session history are gone. Reuse the name and verify no old time.
+   Switch databases while a confirmation is open: it must close and never affect a
+   same-named project in the new database. Close/reopen Reports without stopping
+   tracking, and check write failures leave saved checkbox state and visible errors.
+7. While tray watching is active, start a second CLI watcher against **only this
    temporary database**: it must fail the lock. Quit with a dialog open: it must
    close, and reports must show zero open sessions. Repeat with Ctrl-C/SIGTERM.
    Ensure no test watcher remains before removing the directory.

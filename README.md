@@ -11,8 +11,9 @@ resume. Records stay in a local SQLite database; no account or network is needed
 - **Tray:** [`ksni`](https://github.com/iovxw/ksni) uses StatusNotifierItem (SNI)
   and DBusMenu, requiring a session DBus and a compatible host, such as KDE Plasma
   or DMS / DankMaterialShell. GNOME needs an AppIndicator extension. X11 and
-  Wayland work with a compatible host; legacy XEmbed-only trays do not. Dialogs
-  require Zenity. Windows and macOS are not supported.
+  Wayland work with a compatible host; legacy XEmbed-only trays do not. Settings
+  and reader-scan dialogs require Zenity; status and reports use GTK4 windows.
+  Windows and macOS are not supported.
 - **CLI:** no desktop or tray host required; the same runtime libraries are needed.
 
 ## Install
@@ -74,14 +75,29 @@ The floating window follows the desktop's light/dark preference, including chang
 while open, via the desktop settings portal. If that preference is unavailable,
 it keeps the configured GTK theme. Its compact title bar matches Alacritty's
 35-logical-pixel Wayland title bar, growing if larger fonts need more space.
-Repeated clicks reuse the window; closing it does not stop tracking. Reports remain
-available via **Report…** in the right-click menu. The title/tooltip shows the same
+Repeated clicks reuse the window; closing it does not stop tracking. **Report…**
+opens a separate GTK4 project overview, available even while tracking. The title/tooltip shows the same
 project, status, and checkpointed time; green means tracking, orange waiting/paused,
 grey idle, and red error. Remove the card before changing projects or settings.
 
 **Settings** changes the database, reader, or ATR. Choices last only for this run;
 repeat launch options to reuse them. The tray also accepts `--reader` and `--atr`.
 If an error persists, fix the reported problem and reselect the project to retry.
+
+The reports overview shows every registered project, including projects with no
+sessions, along with checkpointed totals, session/open-session counts, and an
+**Archived** checkbox. Checking it removes the project from **Projects** without
+hiding its history in reports; unchecking restores it to the menu without starting
+tracking. Archiving the selected project disarms its watcher and clears selection.
+Remove the card before archiving, restoring, or deleting any project.
+
+**Delete…** is available only for archived projects. Its confirmation names the
+project and shows the session count and total time. **Cancel** changes nothing;
+**Delete permanently** removes the project and all its time records. The name may
+be reused with no prior history. This is not secure erasure of SQLite storage,
+WAL files, or backups. Errors appear in Reports; if a failed change stopped the
+watcher, reselect the project to retry.
+
 Keep the launching terminal open, or launch the binary from your desktop with an
 absolute `--db` path. No desktop configuration or autostart entry is installed.
 
@@ -118,8 +134,8 @@ command for arbitrary contact smartcards.
   registry. Selected projects persist even without recorded time. Reports stay
   read-only and can still read older databases. Older binaries must not write an
   upgraded database.
-- The persistence API supports archiving, restoring, and permanently deleting
-  projects; user-facing controls are deferred. Archived projects cannot track
+- The GTK4 reports overview supports archiving, restoring, and permanently
+  deleting projects. Archived projects cannot track
   time and are excluded from the tray Projects menu, but their history stays in
   reports. Only archived projects with no open session can be deleted; deletion
   removes all their time records. A deleted name can be reused with no old history.
