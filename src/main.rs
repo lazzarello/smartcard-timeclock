@@ -516,6 +516,11 @@ fn main() -> Result<()> {
         }
         Command::Tray { reader, atr } => {
             let atr = parse_atr(&atr).map_err(anyhow::Error::msg)?;
+            if std::env::var_os("GSK_RENDERER").is_none() {
+                // These text-only windows do not need cold GPU/driver initialization.
+                // SAFETY: main is single-threaded, before GTK, PC/SC, or signal/tray workers.
+                unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+            }
             tray::run(cli.db, reader, atr)
         }
         Command::Report => {

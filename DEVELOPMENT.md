@@ -83,7 +83,8 @@ failed writes without recovery. Watcher regression tests inject PC/SC results
 and elapsed/wall clocks: repeated context/reader outages, pinned identity,
 fresh recovery/card changes, absence before/after recovery, successful polls across
 suspend or write gaps, lock ownership, retry cancellation, and terminal storage
-failures. Four tests are ignored by default:
+failures. Six tests are ignored by default in debug builds (the two timing probes
+are compiled out when debug assertions are disabled):
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
   real SNI/DBusMenu protocols, including idle menu requests that must not open
@@ -120,7 +121,121 @@ failures. Four tests are ignored by default:
   TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- cargo test --locked isolated_theme -- --ignored
   ```
 
+- `status_first_and_reopened_frame_timings` opens Status once and closes/reopens
+  it five times, checking idle state and a still-missing temporary database. It
+  measures a frame-clock proxy, not compositor-visible latency. See below.
+- `isolated_status_startup_first_frame` in `tests/status_startup.rs` launches the
+  actual binary on a private bus, activates it through SNI, checks its default
+  Cairo renderer and missing-database behavior, and reports the first-frame proxy.
+  It supplies a fake watcher/settings portal, disables accessibility and remote
+  VFS **only in its child**, and reaps the child/pipe reader even on failure. It
+  requires a graphical session **and an isolated bus**; see below.
+
 Do not use a blanket `cargo test -- --ignored` on the desktop bus.
+
+### Status-window performance (issue #6)
+
+The tray defaults `GSK_RENDERER` to `cairo` in single-threaded `main`, before any
+signal/tray/GTK workers. Explicit overrides (including an empty value) are left
+unchanged. CLI commands are unaffected, GTK initialization is still lazy, and no
+window is prewarmed. Cairo avoids GPU device/shader startup for the text-only
+Status/Reports windows without changing their widgets, theme, or accessibility.
+Do not move environment mutation into the multithreaded tray controller.
+
+Instrumentation is compiled only with `#[cfg(debug_assertions)]`: standard debug
+builds include it; standard release builds exclude the timing module, timestamps,
+fields, callbacks, and output entirely. `TIMECLOCK_TRACE_STATUS=1` additionally
+opts into collection/output at runtime in a diagnostic-capable build. It has no
+effect in a normal release binary. Normal error reporting is never debug-gated.
+
+For an actual debug tray launch on the desktop, use temporary data:
+
+```sh
+cargo build --locked --bin smartcard-timeclock
+test_dir=$(mktemp -d)
+TIMECLOCK_TRACE_STATUS=1 ./target/debug/smartcard-timeclock \
+  --db "$test_dir/status.sqlite3" tray
+# Click once without first opening Reports/Settings, then close/reopen five times.
+# Quit the test app before removing its temporary directory.
+```
+
+`status-timing` writes one buffered line per activation, with the renderer class
+and cumulative monotonic milliseconds from receipt of SNI Activate: dispatch,
+worker/summary refresh, GTK init, widget construction (or reuse), `present()`,
+mapping observed after `present()`, and `after_paint_proxy`. Cancellation before
+painting is labeled instead of reported as a completed frame. Diagnostic handlers
+are disconnected on replacement/shutdown; unmapping cancels pending samples.
+Normal launches install no diagnostic frame callbacks or forced redraws. Timing
+records contain no project names or database paths.
+
+For automated graphical probes (not ordinary headless CI):
+
+```sh
+# Build before starting the measurement timeout.
+cargo test --locked --test status_startup --no-run
+TIMECLOCK_ISOLATED_BUS=1 timeout 40s dbus-run-session -- \
+  cargo test --locked --test status_startup \
+  isolated_status_startup_first_frame -- --ignored --nocapture
+
+# Same-process close/reopen checks bypass main, so select the new renderer explicitly.
+GSK_RENDERER=cairo TIMECLOCK_TRACE_STATUS=1 cargo test --locked \
+  --bin smartcard-timeclock status_first_and_reopened_frame_timings -- --ignored --nocapture
+```
+
+For optimized diagnostic builds, prefix build/test commands with
+`CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true` and add `--release`. This enables
+the same gated code without adding debug symbols; it is not the stock release
+configuration. Keep comparisons within the same profile and rebuild normally
+before distributing. Debug assertions and debug information are independent.
+`cargo test --locked --release --test status_startup` runs a headless regression
+that checks the normal release binary contains none of the timing environment
+variable/output markers; it does not register fake services or open windows.
+
+The black-box probe reports launch-to-fake-host-registration and DBus-call-to-trace
+receipt separately. It asserts the default renderer only when `GSK_RENDERER` is
+unset; use process-local `GSK_RENDERER=vulkan` or `gl` for diagnostic comparisons
+where supported and check the reported renderer. A renderer fallback is not a
+valid comparison. The direct close/reopen probe approximates the controller's
+100-ms event servicing; neither probe adds a 500-ms CI assertion.
+
+**Acceptance remains a visible-desktop measurement:** record an ordinary tray
+left-click (document press/release semantics) to the first readable Status content
+and decorations in **<500 ms**, not merely `present()`, mapping, or after-paint.
+Use high-frame-rate recording or reliable compositor-presentation evidence and
+report uncertainty; a measurement straddling 500 ms is inconclusive. Direct DBus
+activation excludes host/input dispatch and after-paint does not prove compositor
+presentation. The private-bus fixture also substitutes portal settings and does
+not exercise accessibility.
+
+Compare baseline/candidate in alternating order across 30 fresh processes each;
+retain raw samples, median, p95, maximum, failures and counts >=500 ms. Separately
+check immediate clicks as soon as the real tray is ready, delayed first clicks,
+five close/reopens, Reports-first, and representative temporary history. Record
+launch-to-tray readiness, commit/binary hash, GTK runtime, backend, renderer,
+compositor/tray host, display scale/refresh, overrides and load. Distinguish a fresh
+process from a naturally cold GPU/desktop/cache; do not drop system caches or alter
+host services to manufacture cold starts. Do not pool different environments.
+Recheck theme/focus/fonts/accessibility, Reports, and normal shutdown using the
+manual acceptance steps below. If measured GTK options remain inadequate, stop
+and discuss alternatives rather than switching toolkits.
+
+Initial local evidence: GTK 4.22.4, Wayland/niri 26.04, Intel UHD P630 + NVIDIA
+Quadro P2000 Mobile, Linux 6.18.52. A diagnostic `strace` run found a 1.66-second
+`openat` on a GPU render node. A direct first-opening probe took 1.84 s, including
+1.81 s in `present()`; a GL comparison took 1.50 s to after-paint. On the release
+binary with the private-bus fixture, before instrumentation became debug-only,
+30 interleaved fresh-process trials per mode produced the following **frame
+proxies, not visible acceptance results**:
+
+| Renderer | Median | p95 | Maximum | >=500 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Explicit Vulkan | 125.47 ms | 133.34 ms | 1802.48 ms | 1/30 |
+| Default Cairo | 50.54 ms | 58.34 ms | 64.07 ms | 0/30 |
+
+Median launch-to-registration was 32.10/32.39 ms (Vulkan/Cairo); maximum was
+62.27/36.80 ms, so the probe did not move the stall to startup. Most Vulkan trials
+benefited from already-warm GPU state; these samples do not guarantee genuinely
+cold-cache performance or certify the issue's visible click-to-window target.
 
 ### Test organization and everyday use
 
@@ -137,8 +252,9 @@ Rust distinguishes tests by how they are compiled, not just by their directory:
   builds each top-level `.rs` file there as a separate test crate. They cannot
   access this binary's private functions; use them for black-box CLI checks,
   launching `env!("CARGO_BIN_EXE_smartcard-timeclock")` with `std::process::Command`.
-  This project does not currently have integration tests. Do not expose internals
-  or include `main.rs` in another crate just to move unit tests there.
+  `tests/status_startup.rs` uses this for its opt-in graphical startup probe. Do
+  not expose internals or include `main.rs` in another crate just to move unit
+  tests there.
 
 Enter `devenv shell` first when using the Nix development environment. Useful
 commands (in addition to the full checks above):
@@ -229,7 +345,8 @@ is maintained.
 - `src/tray.rs`: SNI/DBusMenu presentation, controller, worker ownership, and
   Zenity dialog lifecycle. `src/tray/reports.rs` owns the GTK4 project overview
   and delete confirmation widgets; callbacks send actions to the same controller.
-  It uses the same watcher/store as the CLI, not a separate timer.
+  `src/tray/timing.rs` owns debug-only, opt-in activation/frame timing diagnostics.
+  The tray uses the same watcher/store as the CLI, not a separate timer.
 - `src/tests/mod.rs`: CLI/watcher unit tests and fake observations, loaded by
   `#[cfg(test)] mod tests;` in `src/main.rs`. Store and tray unit tests remain
   inline under `#[cfg(test)]` in their implementation modules.

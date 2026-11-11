@@ -75,7 +75,9 @@ The floating window follows the desktop's light/dark preference, including chang
 while open, via the desktop settings portal. If that preference is unavailable,
 it keeps the configured GTK theme. Its compact title bar matches Alacritty's
 35-logical-pixel Wayland title bar, growing if larger fonts need more space.
-Repeated clicks reuse the window; closing it does not stop tracking. **Report…**
+Repeated clicks reuse the window; closing it does not stop tracking. The tray uses
+GTK's Cairo software renderer to avoid cold GPU initialization for these simple
+windows; an explicit `GSK_RENDERER` environment setting takes precedence. **Report…**
 opens a separate GTK4 project overview, available even while tracking. The title/tooltip shows the same
 project, status, and checkpointed time; green means tracking, orange waiting/paused,
 grey idle, and red error. Remove the card before changing projects or settings.

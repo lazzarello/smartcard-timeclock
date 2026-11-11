@@ -1,5 +1,7 @@
 //! Standard SNI/DBusMenu adapter; the only tracker is `watch` in main.rs.
 mod reports;
+#[cfg(debug_assertions)]
+mod timing;
 use super::*;
 use gtk4::{gio, glib, prelude::*};
 use ksni::{
@@ -8,6 +10,8 @@ use ksni::{
     menu::{StandardItem, SubMenu},
 };
 use reports::{ProjectSummary, ProjectTarget, ReportsWindow};
+#[cfg(debug_assertions)]
+use std::time::Instant;
 use std::{
     cell::Cell,
     io::{Read, Write},
@@ -16,6 +20,8 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
 };
+#[cfg(debug_assertions)]
+use timing::{FrameTrace, StatusTiming};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Status {
@@ -97,13 +103,25 @@ enum Action {
     Select(String),
     Entry(Entry),
     Scan,
-    Status,
+    Status {
+        #[cfg(debug_assertions)]
+        requested: Instant,
+    },
     Report,
     Archive(ProjectTarget, bool),
     RequestDelete(ProjectTarget),
     DeleteResponse(ProjectTarget, bool),
     CancelDelete,
     Quit,
+}
+
+impl Action {
+    fn status() -> Self {
+        Self::Status {
+            #[cfg(debug_assertions)]
+            requested: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -187,7 +205,7 @@ impl Tray {
 impl ksni::Tray for Tray {
     const MENU_ON_ACTIVATE: bool = false;
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.tx.send(Action::Status);
+        let _ = self.tx.send(Action::status());
     }
     fn id(&self) -> String {
         "smartcard-timeclock".into()
@@ -465,10 +483,14 @@ fn compact_header() -> gtk4::HeaderBar {
 struct StatusWindow {
     window: gtk4::Window,
     label: gtk4::Label,
+    #[cfg(debug_assertions)]
+    frame_trace: Option<FrameTrace>,
 }
 impl StatusWindow {
-    fn new(view: &Tray) -> Result<Self> {
+    fn new(view: &Tray, #[cfg(debug_assertions)] timing: &mut StatusTiming) -> Result<Self> {
         gtk4::init().context("Cannot open status window; run in a graphical session")?;
+        #[cfg(debug_assertions)]
+        timing.mark("gtk_init");
         let label = gtk4::Label::builder()
             .label(view.status_text())
             .selectable(true)
@@ -485,7 +507,14 @@ impl StatusWindow {
             .child(&label)
             .build();
         window.set_titlebar(Some(&titlebar));
-        Ok(Self { window, label })
+        #[cfg(debug_assertions)]
+        timing.mark("widgets");
+        Ok(Self {
+            window,
+            label,
+            #[cfg(debug_assertions)]
+            frame_trace: None,
+        })
     }
     fn update(&self, view: &Tray) {
         let text = view.status_text();
@@ -496,6 +525,8 @@ impl StatusWindow {
 }
 impl Drop for StatusWindow {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.frame_trace.take();
         self.window.destroy();
     }
 }
@@ -690,18 +721,44 @@ impl Controller {
         Ok(())
     }
     fn action(&mut self, action: Action) -> Result<()> {
+        if let Action::Status {
+            #[cfg(debug_assertions)]
+            requested,
+        } = action
+        {
+            #[cfg(debug_assertions)]
+            let mut timing = {
+                let mut timing = StatusTiming::new(requested);
+                timing.mark("dispatch");
+                timing
+            };
+            self.poll_worker()?;
+            #[cfg(debug_assertions)]
+            timing.mark("worker_refresh");
+            if self.status_window.is_none() {
+                self.status_window = Some(StatusWindow::new(
+                    &self.view,
+                    #[cfg(debug_assertions)]
+                    &mut timing,
+                )?);
+            } else {
+                #[cfg(debug_assertions)]
+                timing.mark("reuse");
+            }
+            self.ensure_theme();
+            let status = self.status_window.as_mut().unwrap();
+            status.update(&self.view);
+            status.window.present();
+            #[cfg(debug_assertions)]
+            {
+                timing.mark("present");
+                status.frame_trace = FrameTrace::new(&status.window, timing);
+            }
+            return Ok(());
+        }
         self.poll_worker()?;
         match action {
             Action::Select(project) => self.apply(Entry::Project, project)?,
-            Action::Status => {
-                if self.status_window.is_none() {
-                    self.status_window = Some(StatusWindow::new(&self.view)?);
-                }
-                self.ensure_theme();
-                let status = self.status_window.as_ref().unwrap();
-                status.update(&self.view);
-                status.window.present();
-            }
             Action::Entry(entry) if self.dialog.is_none() => {
                 ensure!(
                     self.view.editable(),
@@ -977,8 +1034,18 @@ mod tests {
             Status::Error("Reader unavailable".into()),
         ] {
             c.view.status = status.clone();
+            #[cfg(debug_assertions)]
+            let before = Instant::now();
             ksni::Tray::activate(&mut c.view, 0, 0);
-            assert!(matches!(rx.try_recv().unwrap(), Action::Status));
+            let Action::Status {
+                #[cfg(debug_assertions)]
+                requested,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("Left click must request Status");
+            };
+            #[cfg(debug_assertions)]
+            assert!((before..=Instant::now()).contains(&requested));
             assert!(rx.try_recv().is_err());
             assert_eq!(c.view.status, status);
         }
@@ -1537,6 +1604,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[ignore = "requires GTK4 and a graphical session; reports first/warm frame proxies, not visible latency"]
+    fn status_first_and_reopened_frame_timings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("unused.db");
+        let mut c = controller(db.clone());
+        c.view.settings.project.clear();
+        for attempt in 0..6 {
+            let requested = Instant::now();
+            c.action(Action::Status { requested }).unwrap();
+            let window = c.status_window.as_ref().unwrap().window.clone();
+            let clock = window.frame_clock().unwrap();
+            let painted = Rc::new(Cell::new(false));
+            let done = painted.clone();
+            let handler = clock.connect_after_paint(move |_| done.set(true));
+            window.queue_draw();
+            while !painted.get() {
+                assert!(requested.elapsed() < Duration::from_secs(10), "No frame");
+                c.poll().unwrap();
+                if !painted.get() {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            clock.disconnect(handler);
+            eprintln!(
+                "status-frame-sample attempt={attempt} after_paint_proxy={:.3}ms",
+                requested.elapsed().as_secs_f64() * 1000.0
+            );
+            assert!(c.worker.is_none());
+            assert_eq!(c.view.status, Status::Idle);
+            assert!(!db.exists());
+            window.close();
+            c.poll().unwrap();
+            assert!(!window.is_visible());
+        }
+    }
+
+    #[test]
     #[ignore = "requires GTK4 and a graphical session; briefly opens status/report windows"]
     fn status_and_report_without_card_or_active_project_opens_and_preserves_history() {
         for has_history in [false, true] {
@@ -1544,7 +1649,7 @@ mod tests {
             let db = dir.path().join("report.db");
             let mut c = controller(db.clone());
             c.view.settings.project.clear();
-            c.action(Action::Status).unwrap();
+            c.action(Action::status()).unwrap();
             c.poll().unwrap();
             assert!(!db.exists());
             assert!(c.worker.is_none());
@@ -1596,7 +1701,7 @@ mod tests {
             window.close();
             c.poll().unwrap();
             assert!(!window.is_visible());
-            c.action(Action::Status).unwrap();
+            c.action(Action::status()).unwrap();
             assert!(window.is_visible());
             assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker_id);
             assert_eq!(c.view.status, Status::Watching(WatchState::CardAbsent));
@@ -1742,7 +1847,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("unused.db");
         let mut c = controller(db.clone());
-        c.action(Action::Status).unwrap();
+        c.action(Action::status()).unwrap();
         let wait_for_theme = |c: &mut Controller, dark| {
             for _ in 0..400 {
                 c.poll().unwrap();
@@ -1780,7 +1885,7 @@ mod tests {
         c.status_window.as_ref().unwrap().window.close();
         change(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, 1);
         wait_for_theme(&mut c, true);
-        c.action(Action::Status).unwrap();
+        c.action(Action::status()).unwrap();
         assert!(settings.is_gtk_application_prefer_dark_theme());
         change(APPEARANCE_NAMESPACE, "unrelated", 2);
         change("org.example.unrelated", COLOR_SCHEME_KEY, 2);
@@ -1914,7 +2019,7 @@ mod tests {
         let _: () = item.call("Activate", &(0i32, 0i32)).unwrap();
         assert!(matches!(
             received.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Action::Status
+            Action::Status { .. }
         ));
         let icons: Vec<(i32, i32, Vec<u8>)> = item.get_property("IconPixmap").unwrap();
         assert_eq!(icons[0].2.len(), 32 * 32 * 4);
