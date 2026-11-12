@@ -9,8 +9,10 @@ Keep those documents in sync with user-visible changes.
 - Keep changes small and complete. Reuse existing code and dependencies; avoid
   new abstractions, configuration, or features without a concrete need.
 - `src/main.rs` owns CLI/PCSC/watcher logic, `src/store.rs` owns persistence and
-  reports, and `src/tray.rs` adapts the shared watcher to SNI/DBusMenu and Zenity.
-  Do not create a separate tray timer or add manual tracking controls.
+  reports, and `src/tray.rs` adapts the shared watcher to SNI/DBusMenu and GTK4.
+  `src/tray/dialogs.rs` owns GTK entry/scan/error widgets; reuse the shared theme,
+  compact header and tray Cairo default. Do not create a separate tray timer or
+  add manual tracking controls.
 - Rust edition 2024, minimum Rust 1.89. Preserve that minimum and commit
   `Cargo.lock` changes when dependencies intentionally change.
 - Keep the single container CI pipeline in `.github/workflows/ci.yml`; the
@@ -35,8 +37,12 @@ Keep those documents in sync with user-visible changes.
   changes are forbidden while tracking, including stale dialog submissions.
   Validate before mutation, recheck worker events after blocking validation,
   join the old worker before switching, and discard stale events.
-- Cancel changes nothing; OK applies once and closes the dialog. Reap all child
-  processes/pipe threads on completion and shutdown. Surface errors honestly and
+- Cancel changes nothing; OK applies once and closes the dialog. Destroy all
+  windows and cancel pending callbacks on shutdown. Keep GTK servicing active
+  for entry/scan/error-only windows; serialize explicit background scans and join
+  their worker on shutdown. Reject stale dialog identities/revisions and keep
+  tracking guards authoritative at submission. Reap test child processes
+  and pipe threads on completion and shutdown. Surface errors honestly and
   preserve accessible labels, focus, status, and menu escaping.
 - Use temporary databases for tests and manual checks. Never touch real time
   records, delete a live lock, discard live WAL/SHM files, or commit private data.
@@ -58,7 +64,7 @@ cargo build --locked --release --bin smartcard-timeclock
 ```
 
 Never run the fake StatusNotifierWatcher test on the desktop bus or use blanket
-`--ignored` there. The real Zenity test, card insertion/removal, desktop tray,
+`--ignored` there. Real GTK window tests, card insertion/removal, desktop tray,
 and accessibility checks require the manual steps in `DEVELOPMENT.md`. State
 which checks ran and which remain unverified; do not claim hardware/GUI success
 from headless tests.
