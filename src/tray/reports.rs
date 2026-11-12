@@ -307,7 +307,6 @@ mod tests {
         c.poll().unwrap();
         assert!(c.status_window.is_none());
         assert!(c.worker.is_none());
-        assert!(c.dialog.is_none());
         assert!(!db.exists());
         let window = c.reports_window.as_ref().unwrap().window.clone();
         c.action(Action::Report).unwrap();

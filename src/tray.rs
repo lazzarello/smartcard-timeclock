@@ -1,5 +1,7 @@
 //! Standard SNI/DBusMenu adapter; the only tracker is `watch` in main.rs.
+mod dialogs;
 mod reports;
+use dialogs::{EntryWindow, ErrorWindow, ScanWindow};
 #[cfg(debug_assertions)]
 mod timing;
 use super::*;
@@ -14,8 +16,6 @@ use reports::{ProjectSummary, ProjectTarget, ReportsWindow};
 use std::time::Instant;
 use std::{
     cell::Cell,
-    io::{Read, Write},
-    process::{Child, Command as ProcessCommand, Stdio},
     rc::Rc,
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
@@ -102,7 +102,9 @@ enum Entry {
 enum Action {
     Select(String),
     Entry(Entry),
+    EntryResponse(u64, Option<String>),
     Scan,
+    RefreshScan,
     Status {
         #[cfg(debug_assertions)]
         requested: Instant,
@@ -305,92 +307,6 @@ impl ksni::Tray for Tray {
     }
 }
 
-// Own and reap every dialog, including pipe readers/writers, even on signals or Quit.
-struct Dialog {
-    child: Child,
-    output: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    input: Option<JoinHandle<std::io::Result<()>>>,
-    entry: Option<Entry>,
-}
-impl Dialog {
-    fn spawn(entry: Option<Entry>, title: &str, text: String) -> Result<Self> {
-        let mut command = ProcessCommand::new("zenity");
-        command.args(["--title", title, "--width=640"]);
-        if entry.is_some() {
-            command.args(["--entry", "--text", title, "--entry-text", &text]);
-        } else {
-            command.args(["--text-info", "--font=monospace", "--height=480"]);
-        }
-        Self::launch(command, entry, text)
-    }
-    fn launch(mut command: ProcessCommand, entry: Option<Entry>, text: String) -> Result<Self> {
-        let mut child = command
-            .stdin(if entry.is_some() {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            })
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("Cannot open dialog; install Zenity and run in a graphical session")?;
-        let mut stdout = child.stdout.take().unwrap();
-        let output = Some(thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        }));
-        let input = child
-            .stdin
-            .take()
-            .map(|mut stdin| thread::spawn(move || stdin.write_all(text.as_bytes())));
-        Ok(Self {
-            child,
-            output,
-            input,
-            entry,
-        })
-    }
-    fn poll(&mut self) -> Result<Option<Option<String>>> {
-        let Some(status) = self.child.try_wait()? else {
-            return Ok(None);
-        };
-        let bytes = self
-            .output
-            .take()
-            .unwrap()
-            .join()
-            .map_err(|_| anyhow::anyhow!("Dialog reader panicked"))??;
-        if let Some(input) = self.input.take() {
-            let _ = input.join();
-        } // Closing a report early may break its pipe.
-        if status.code() == Some(1) {
-            return Ok(Some(None));
-        }
-        ensure!(
-            status.success(),
-            "Zenity failed ({status}); check the graphical session"
-        );
-        let mut text = String::from_utf8(bytes)?;
-        // Remove only Zenity's line terminator, not whitespace in project/reader names.
-        if text.ends_with('\n') {
-            text.pop();
-        }
-        Ok(Some(Some(text)))
-    }
-}
-impl Drop for Dialog {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(output) = self.output.take() {
-            let _ = output.join();
-        }
-        if let Some(input) = self.input.take() {
-            let _ = input.join();
-        }
-    }
-}
-
 const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
 const COLOR_SCHEME_KEY: &str = "color-scheme";
 
@@ -531,11 +447,24 @@ impl Drop for StatusWindow {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingEntry {
+    id: u64,
+    entry: Entry,
+    revision: u64,
+}
+
 struct Controller {
+    entry_window: Option<EntryWindow>,
+    pending_entry: Option<PendingEntry>,
+    entry_serial: u64,
+    scan_window: Option<ScanWindow>,
+    scan_worker: Option<JoinHandle<Result<String>>>,
+    scan: fn() -> Result<String>,
+    error_window: Option<ErrorWindow>,
     view: Tray,
     worker: Option<Worker>,
     spawn_worker: fn(Settings) -> Worker,
-    dialog: Option<Dialog>,
     status_window: Option<StatusWindow>,
     reports_window: Option<ReportsWindow>,
     project_rows: Vec<ProjectSummary>,
@@ -544,6 +473,50 @@ struct Controller {
     theme: Option<glib::JoinHandle<()>>,
 }
 impl Controller {
+    fn entry_response(&mut self, id: u64, text: Option<String>) -> Result<()> {
+        let Some(pending) = self.pending_entry.filter(|pending| pending.id == id) else {
+            return Ok(()); // Closed/replaced dialogs cannot submit again.
+        };
+        self.pending_entry = None;
+        self.entry_window.take();
+        self.view.dialog_open = false;
+        if let Some(text) = text {
+            ensure!(
+                pending.revision == self.project_revision,
+                "Settings or projects changed; reopen the dialog and try again"
+            );
+            self.apply(pending.entry, text)?;
+        }
+        Ok(())
+    }
+    fn refresh_scan(&mut self) {
+        if self.scan_worker.is_none() {
+            if let Some(window) = &self.scan_window {
+                window.scanning();
+            }
+            let scan = self.scan;
+            self.scan_worker = Some(thread::spawn(scan));
+        }
+    }
+    fn poll_scan(&mut self) -> Result<()> {
+        if self
+            .scan_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            let result = self
+                .scan_worker
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Reader scan thread panicked")));
+            if let Some(window) = &self.scan_window {
+                window.finish(&result);
+            }
+            result?;
+        }
+        Ok(())
+    }
     fn stop(&mut self) -> Result<()> {
         if let Some(worker) = self.worker.take() {
             worker.stop()?;
@@ -706,8 +679,8 @@ impl Controller {
             "Remove the target card before changing the project or settings"
         );
         self.stop()?;
+        self.project_revision += 1;
         if settings.db != self.view.settings.db {
-            self.project_revision += 1;
             self.cancel_delete();
             self.project_rows.clear();
         }
@@ -721,6 +694,10 @@ impl Controller {
         Ok(())
     }
     fn action(&mut self, action: Action) -> Result<()> {
+        // Consume responses even when a watcher has just failed; no hidden dialog may remain armed.
+        if let Action::EntryResponse(id, text) = action {
+            return self.entry_response(id, text);
+        }
         if let Action::Status {
             #[cfg(debug_assertions)]
             requested,
@@ -759,33 +736,44 @@ impl Controller {
         self.poll_worker()?;
         match action {
             Action::Select(project) => self.apply(Entry::Project, project)?,
-            Action::Entry(entry) if self.dialog.is_none() => {
+            Action::Entry(entry) => {
                 ensure!(
                     self.view.editable(),
                     "Remove the target card before changing the project or settings"
                 );
-                let (title, text) = match entry {
-                    Entry::Project => (
-                        "Project name (case-sensitive)",
-                        self.view.settings.project.clone(),
-                    ),
-                    Entry::Database => (
-                        "SQLite database path",
-                        self.view.settings.db.to_string_lossy().into_owned(),
-                    ),
-                    Entry::Reader => (
-                        "Exact reader name (empty = automatic; use Scan readers)",
-                        self.view.settings.reader.clone().unwrap_or_default(),
-                    ),
-                    Entry::Atr => (
-                        "Target ATR (card type, not unique identity)",
-                        format_atr(&self.view.settings.atr),
-                    ),
-                };
-                self.dialog = Some(Dialog::spawn(Some(entry), title, text)?);
+                if let Some(window) = &self.entry_window {
+                    window.window.present();
+                } else {
+                    self.entry_serial += 1;
+                    let window = EntryWindow::new(
+                        entry,
+                        &self.view.settings,
+                        self.entry_serial,
+                        self.view.tx.clone(),
+                    )?;
+                    self.pending_entry = Some(PendingEntry {
+                        id: self.entry_serial,
+                        entry,
+                        revision: self.project_revision,
+                    });
+                    self.view.dialog_open = true;
+                    self.ensure_theme();
+                    window.window.present();
+                    self.entry_window = Some(window);
+                }
             }
-            Action::Scan if self.dialog.is_none() => {
-                self.dialog = Some(Dialog::spawn(None, "PC/SC readers", scan_text()?)?);
+            Action::Scan => {
+                if self.scan_window.is_none() {
+                    self.scan_window = Some(ScanWindow::new(self.view.tx.clone())?);
+                    self.refresh_scan();
+                }
+                self.ensure_theme();
+                self.scan_window.as_ref().unwrap().window.present();
+            }
+            Action::RefreshScan => {
+                if self.scan_window.is_some() {
+                    self.refresh_scan();
+                }
             }
             Action::Report => {
                 if self.reports_window.is_none() {
@@ -857,25 +845,22 @@ impl Controller {
             status.update(&self.view);
         }
         self.update_reports();
-        if self.status_window.is_some() || self.reports_window.is_some() {
+        if let Some(entry) = &self.entry_window {
+            entry.update(self.view.editable());
+        }
+        // Service GTK even when Scan, Settings or an error is the only window.
+        if self.status_window.is_some()
+            || self.reports_window.is_some()
+            || self.entry_window.is_some()
+            || self.scan_window.is_some()
+            || self.error_window.is_some()
+        {
             let context = gtk4::glib::MainContext::default();
             while context.pending() {
                 context.iteration(false);
             }
         }
-        if let Some(dialog) = &mut self.dialog {
-            let result = dialog.poll();
-            if !matches!(result, Ok(None)) {
-                let dialog = self.dialog.take().unwrap();
-                if let Some(entry) = dialog.entry {
-                    if let Some(Some(text)) = result? {
-                        self.apply(entry, text)?;
-                    }
-                } else {
-                    result?;
-                }
-            }
-        }
+        self.poll_scan()?;
         Ok(())
     }
     fn error(&mut self, error: anyhow::Error) {
@@ -883,6 +868,10 @@ impl Controller {
         eprintln!("{text}");
         if let Some(reports) = &self.reports_window {
             reports.show_error(&text);
+        }
+        if gtk4::is_initialized_main_thread() {
+            self.error_window = Some(ErrorWindow::new(&text));
+            self.ensure_theme();
         }
         if self.worker.is_none() {
             self.view.status = Status::Error(text);
@@ -894,11 +883,21 @@ impl Drop for Controller {
         if let Some(theme) = self.theme.take() {
             theme.abort();
         }
+        self.pending_entry = None;
+        self.entry_window.take();
+        self.scan_window.take();
+        self.error_window.take();
         self.reports_window.take();
         self.status_window.take();
-        self.dialog.take();
         if let Err(error) = self.stop() {
             eprintln!("Cannot stop watcher cleanly: {error:#}");
+        }
+        if let Some(worker) = self.scan_worker.take() {
+            match worker.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("Reader scan failed during shutdown: {error:#}"),
+                Err(_) => eprintln!("Reader scan thread panicked during shutdown"),
+            }
         }
     }
 }
@@ -922,10 +921,16 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
         dialog_open: false,
     };
     let mut controller = Controller {
+        entry_window: None,
+        pending_entry: None,
+        entry_serial: 0,
+        scan_window: None,
+        scan_worker: None,
+        scan: scan_text,
+        error_window: None,
         view,
         worker: None,
         spawn_worker: Worker::watch,
-        dialog: None,
         status_window: None,
         reports_window: None,
         project_rows: Vec::new(),
@@ -951,10 +956,8 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
         if let Err(error) = controller.poll() {
             controller.error(error);
         }
-        controller.view.dialog_open = controller.dialog.is_some();
         handle.update(|view| *view = controller.view.clone());
     }
-    controller.dialog.take();
     let result = controller.stop();
     handle.shutdown().wait();
     result
@@ -963,10 +966,18 @@ pub fn run(db: PathBuf, reader: Option<String>, atr: Vec<u8>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as ProcessCommand;
 
     pub(super) fn controller(db: PathBuf) -> Controller {
         let (tx, _) = mpsc::channel();
         Controller {
+            entry_window: None,
+            pending_entry: None,
+            entry_serial: 0,
+            scan_window: None,
+            scan_worker: None,
+            scan: scan_text,
+            error_window: None,
             view: Tray {
                 tx,
                 settings: Settings {
@@ -990,7 +1001,6 @@ mod tests {
                     Ok(())
                 })
             },
-            dialog: None,
             status_window: None,
             reports_window: None,
             project_rows: Vec::new(),
@@ -1261,6 +1271,138 @@ mod tests {
         assert_eq!(c.view.project_seconds, 0);
     }
 
+    fn pending_entry(c: &mut Controller, id: u64, entry: Entry) {
+        c.pending_entry = Some(PendingEntry {
+            id,
+            entry,
+            revision: c.project_revision,
+        });
+        c.view.dialog_open = true;
+    }
+
+    #[test]
+    fn entry_responses_cancel_apply_once_and_preserve_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        c.start_watching().unwrap();
+        let worker = c.worker.as_ref().unwrap().thread.thread().id();
+        pending_entry(&mut c, 1, Entry::Project);
+        c.action(Action::EntryResponse(1, None)).unwrap();
+        assert_eq!(c.view.settings.project, "old_project <&>");
+        assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker);
+        assert!(!c.view.dialog_open);
+        assert!(c.pending_entry.is_none());
+        for (id, entry, text) in [
+            (2, Entry::Project, "  项目_a '<&> $(literal)  "),
+            (3, Entry::Reader, " exact_reader 项目 <&>  "),
+        ] {
+            pending_entry(&mut c, id, entry);
+            c.action(Action::EntryResponse(id, Some(text.into())))
+                .unwrap();
+            let worker = c.worker.as_ref().unwrap().thread.thread().id();
+            let revision = c.project_revision;
+            c.action(Action::EntryResponse(id, Some("duplicate".into())))
+                .unwrap();
+            assert_eq!(c.project_revision, revision);
+            assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker);
+            assert!(!c.view.dialog_open);
+        }
+        assert_eq!(c.view.settings.project, "  项目_a '<&> $(literal)  ");
+        assert_eq!(
+            c.view.settings.reader.as_deref(),
+            Some(" exact_reader 项目 <&>  ")
+        );
+        assert!(!c.view.settings.db.exists());
+    }
+
+    #[test]
+    fn stale_entry_response_cannot_change_replacement_or_revised_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        pending_entry(&mut c, 2, Entry::Reader);
+        c.action(Action::EntryResponse(1, Some("stale".into())))
+            .unwrap();
+        assert_eq!(c.pending_entry.unwrap().id, 2);
+        assert!(c.view.dialog_open);
+        c.apply(Entry::Atr, "3B00".into()).unwrap();
+        let worker = c.worker.as_ref().unwrap().thread.thread().id();
+        assert!(
+            c.action(Action::EntryResponse(2, Some("stale".into())))
+                .is_err()
+        );
+        assert!(c.view.settings.reader.is_none());
+        assert!(c.pending_entry.is_none());
+        assert!(!c.view.dialog_open);
+        assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker);
+        pending_entry(&mut c, 3, Entry::Atr);
+        assert!(
+            c.action(Action::EntryResponse(3, Some("invalid".into())))
+                .is_err()
+        );
+        assert!(!c.view.dialog_open);
+        assert_eq!(c.view.settings.atr, [0x3b, 0]);
+        assert!(!c.view.settings.db.exists());
+    }
+
+    #[test]
+    fn entry_response_closes_even_when_the_watcher_fails_before_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        c.worker = Some(Worker::spawn(|_, _| anyhow::bail!("watcher failed")));
+        while !c.worker.as_ref().unwrap().thread.is_finished() {
+            thread::yield_now();
+        }
+        pending_entry(&mut c, 1, Entry::Project);
+        assert!(
+            c.action(Action::EntryResponse(1, Some("must not apply".into())))
+                .is_err()
+        );
+        assert!(c.pending_entry.is_none());
+        assert!(!c.view.dialog_open);
+        assert_eq!(c.view.settings.project, "old_project <&>");
+        assert!(!c.view.settings.db.exists());
+    }
+
+    #[test]
+    fn scan_refresh_error_retry_and_shutdown_leave_watcher_and_database_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = controller(dir.path().join("unused.db"));
+        c.start_watching().unwrap();
+        let worker = c.worker.as_ref().unwrap().thread.thread().id();
+        c.scan = || anyhow::bail!("PC/SC unavailable");
+        c.refresh_scan();
+        let scan = c.scan_worker.as_ref().unwrap().thread().id();
+        c.refresh_scan();
+        assert_eq!(c.scan_worker.as_ref().unwrap().thread().id(), scan);
+        while !c.scan_worker.as_ref().unwrap().is_finished() {
+            thread::yield_now();
+        }
+        assert!(
+            c.poll_scan()
+                .unwrap_err()
+                .to_string()
+                .contains("PC/SC unavailable")
+        );
+        c.scan = || Ok("Reader <&> 项目\n  ATR: 3B00".into());
+        c.refresh_scan();
+        while !c.scan_worker.as_ref().unwrap().is_finished() {
+            thread::yield_now();
+        }
+        c.poll_scan().unwrap();
+        assert!(c.scan_worker.is_none());
+        assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), worker);
+        let db = c.view.settings.db.clone();
+        assert!(!db.exists());
+        let (tx, rx) = mpsc::channel();
+        c.scan_worker = Some(thread::spawn(move || {
+            tx.send(()).unwrap();
+            Ok(String::new())
+        }));
+        drop(c);
+        rx.try_recv().unwrap();
+        assert!(!db.exists());
+    }
+
     #[test]
     fn validation_does_not_mutate_settings_or_create_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -1285,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn tracking_locks_menus_settings_and_stale_dialog_submissions() {
+    fn tracking_locks_menus_settings_and_queued_submissions() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = controller(dir.path().join("unused.db"));
         c.projects().unwrap();
@@ -1305,6 +1447,12 @@ mod tests {
         wait.recv_timeout(Duration::from_secs(2)).unwrap();
         let id = c.worker.as_ref().unwrap().thread.thread().id();
         // The view is still idle: queued worker events must be checked before actions.
+        pending_entry(&mut c, 1, Entry::Project);
+        assert!(
+            c.action(Action::EntryResponse(1, Some("stale dialog".into())))
+                .is_err()
+        );
+        assert!(!c.view.dialog_open);
         assert!(c.action(Action::Select("other".into())).is_err());
         assert_eq!(c.view.settings.project, "old_project <&>");
         assert!(!c.view.editable());
@@ -1317,18 +1465,6 @@ mod tests {
                 assert!(!menu.enabled);
             }
         }
-        // An entry dialog opened before insertion cannot change the active project.
-        c.dialog = Some(fake_dialog("printf 'other\\n'"));
-        let mut rejected = false;
-        for _ in 0..200 {
-            if c.poll().is_err() {
-                rejected = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(rejected);
-        assert!(c.dialog.is_none());
         assert_eq!(id, c.worker.as_ref().unwrap().thread.thread().id());
         assert_eq!(c.view.settings.project, "old_project <&>");
 
@@ -1576,33 +1712,6 @@ mod tests {
         assert_eq!((row.seconds, row.open), (5, 1));
     }
 
-    fn fake_dialog(script: &str) -> Dialog {
-        let mut command = ProcessCommand::new("sh");
-        command.args(["-c", script]);
-        Dialog::launch(command, Some(Entry::Project), String::new()).unwrap()
-    }
-    fn wait_dialog(dialog: &mut Dialog) -> Result<Option<String>> {
-        for _ in 0..200 {
-            if let Some(result) = dialog.poll()? {
-                return Ok(result);
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        anyhow::bail!("Fake dialog timed out")
-    }
-    #[test]
-    fn dialogs_preserve_input_distinguish_cancel_and_reap_on_drop() {
-        assert_eq!(
-            wait_dialog(&mut fake_dialog("printf '  name_;$()  \\n'")).unwrap(),
-            Some("  name_;$()  ".into())
-        );
-        assert_eq!(wait_dialog(&mut fake_dialog("exit 1")).unwrap(), None);
-        assert!(wait_dialog(&mut fake_dialog("exit 2")).is_err());
-        let start = std::time::Instant::now();
-        drop(fake_dialog("exec sleep 30"));
-        assert!(start.elapsed() < Duration::from_secs(2));
-    }
-
     #[test]
     #[cfg(debug_assertions)]
     #[ignore = "requires GTK4 and a graphical session; reports first/warm frame proxies, not visible latency"]
@@ -1666,7 +1775,6 @@ mod tests {
             ksni::Tray::activate(&mut c.view, 0, 0);
             c.action(rx.try_recv().unwrap()).unwrap();
             let window = c.status_window.as_ref().unwrap().window.clone();
-            assert!(c.dialog.is_none());
             assert_eq!(
                 c.status_window.as_ref().unwrap().label.text(),
                 "Select project"
@@ -1718,7 +1826,6 @@ mod tests {
             let reports = c.reports_window.as_ref().unwrap().window.clone();
             c.action(Action::Report).unwrap();
             assert_eq!(c.reports_window.as_ref().unwrap().window, reports);
-            assert!(c.dialog.is_none());
             c.poll().unwrap();
             assert!(reports.is_visible());
             assert!(c.worker.is_none());
@@ -1731,75 +1838,6 @@ mod tests {
                 store::report_text(&store::report_rows(&db).unwrap()),
                 before
             );
-        }
-    }
-
-    #[test]
-    fn cancelled_dialog_leaves_selection_and_active_worker_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = controller(dir.path().join("unused.db"));
-        c.worker = Some(Worker::spawn(|running, tx| {
-            tx.send(WatchState::Waiting)?;
-            while running.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Ok(())
-        }));
-        let id = c.worker.as_ref().unwrap().thread.thread().id();
-        c.dialog = Some(fake_dialog("exit 1"));
-        for _ in 0..200 {
-            c.poll().unwrap();
-            if c.dialog.is_none() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(c.dialog.is_none());
-        assert_eq!(c.view.settings.project, "old_project <&>");
-        assert_eq!(c.worker.as_ref().unwrap().thread.thread().id(), id);
-        assert!(!c.view.settings.db.exists());
-        c.stop().unwrap();
-    }
-
-    #[test]
-    fn settings_ok_and_cancel_close_the_dialog() {
-        for accepted in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut c = controller(dir.path().join("unused.db"));
-            c.view.settings.reader = Some("old reader".into());
-            c.start_watching().unwrap();
-            let id = c.worker.as_ref().unwrap().thread.thread().id();
-            let mut dialog = fake_dialog(if accepted {
-                "printf 'new reader  \\n'"
-            } else {
-                "printf 'discarded reader\\n'; exit 1"
-            });
-            dialog.entry = Some(Entry::Reader);
-            c.dialog = Some(dialog);
-            for _ in 0..200 {
-                c.poll().unwrap();
-                if c.dialog.is_none() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            assert!(c.dialog.is_none());
-            assert_eq!(
-                c.view.settings.reader.as_deref(),
-                Some(if accepted {
-                    "new reader  "
-                } else {
-                    "old reader"
-                })
-            );
-            let current_id = c.worker.as_ref().unwrap().thread.thread().id();
-            if accepted {
-                assert_ne!(id, current_id);
-            } else {
-                assert_eq!(id, current_id);
-            }
-            assert_eq!(c.view.settings.project, "old_project <&>");
-            assert!(!c.view.settings.db.exists());
         }
     }
 
@@ -2010,7 +2048,6 @@ mod tests {
         assert!(c.view.settings.project.is_empty());
         assert!(c.worker.is_none());
         assert!(c.status_window.is_none());
-        assert!(c.dialog.is_none());
         assert!(!c.view.settings.db.exists());
 
         c.view.settings.project = "old_project <&>".into();

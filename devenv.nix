@@ -5,7 +5,7 @@
   env.GREET = "timeclock";
 
   # https://devenv.sh/packages/
-  packages = [ pkgs.git pkgs.pkg-config pkgs.pcsclite pkgs.pcsc-tools pkgs.sqlite pkgs.gtk4 pkgs.zenity pkgs.dbus ];
+  packages = [ pkgs.git pkgs.pkg-config pkgs.pcsclite pkgs.pcsc-tools pkgs.sqlite pkgs.gtk4 pkgs.dbus ];
 
   # https://devenv.sh/languages/
   languages.rust.enable = true;

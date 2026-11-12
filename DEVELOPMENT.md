@@ -6,10 +6,9 @@ Agent-specific instructions live in [AGENTS.md](AGENTS.md).
 ## Setup
 
 Use Rust **1.89+**, Cargo, rustfmt, Clippy, pkg-config, and the PC/SC and SQLite
-headers/libraries, plus GTK4 development libraries for the tray status window.
-The CLI needs no display (GTK is initialized only when opening the status window).
-Tray settings and reader-scan dialogs additionally need Zenity. GTK4 status/reports
-windows and tray dialogs need a graphical session; the tray needs a session DBus
+headers/libraries, plus GTK4 development libraries for tray windows.
+The CLI needs no display (GTK is initialized only when opening a window).
+GTK4 windows need a graphical session; the tray needs a session DBus
 and StatusNotifierItem/DBusMenu host.
 
 The existing Nix environment supplies Rust and the native/development tools:
@@ -28,7 +27,7 @@ For Debian/Ubuntu:
 
 ```sh
 sudo apt-get install build-essential pkg-config libpcsclite-dev libsqlite3-dev libgtk-4-dev \
-  pcscd libccid pcsc-tools dbus dbus-bin sqlite3 zenity
+  pcscd libccid pcsc-tools dbus dbus-bin sqlite3
 sudo systemctl enable --now pcscd.socket
 rustup component add rustfmt clippy
 ```
@@ -72,7 +71,7 @@ cargo build --locked --release --bin smartcard-timeclock
 
 The normal tests require no physical reader or desktop. They cover ATR parsing,
 reader selection, matching, session persistence/recovery, clock rollback, write
-contention, locking, reports, tray state, settings, and dialog lifecycle using
+contention, locking, reports, tray state, and settings validation using
 fake observations and temporary databases. Store regressions also cover v0→v1
 migration, rollback/reopen, exact names, schema-version rejection, foreign keys,
 archive/restore/delete, cascading rollback, name reuse, zero-session discovery,
@@ -83,7 +82,11 @@ failed writes without recovery. Watcher regression tests inject PC/SC results
 and elapsed/wall clocks: repeated context/reader outages, pinned identity,
 fresh recovery/card changes, absence before/after recovery, successful polls across
 suspend or write gaps, lock ownership, retry cancellation, and terminal storage
-failures. Six tests are ignored by default in debug builds (the two timing probes
+failures. Entry-response tests cover cancellation, literal text, exactly-once
+application, stale identities/revisions, queued tracking and watcher failure.
+Reader-scan tests cover serialized refresh, error/retry, watcher independence and
+joining on shutdown without creating a database. Seven tests are ignored by
+default in debug builds (the two timing probes
 are compiled out when debug assertions are disabled):
 
 - `isolated_protocol…` registers a fake StatusNotifierWatcher and exercises the
@@ -108,6 +111,16 @@ are compiled out when debug assertions are disabled):
 
   ```sh
   cargo test --locked reports_archive_restore_delete_and_independent_window_lifecycle -- --ignored
+  ```
+
+- `gtk_entries_scan_and_errors_service_events_without_status_or_reports` opens
+  real GTK entry, reader-scan and error windows independently of Status/Reports.
+  It checks GTK servicing, theme subscription initialization, labeled entry
+  submission/cancel/close, tracking sensitivity, literal text, refresh failure and
+  retry, scan reuse and destruction. It uses a fake scan function, not hardware:
+
+  ```sh
+  cargo test --locked gtk_entries_scan_and_errors_service_events_without_status_or_reports -- --ignored
   ```
 
 - `isolated_theme…` registers a fake desktop settings portal and checks initial
@@ -139,7 +152,10 @@ The tray defaults `GSK_RENDERER` to `cairo` in single-threaded `main`, before an
 signal/tray/GTK workers. Explicit overrides (including an empty value) are left
 unchanged. CLI commands are unaffected, GTK initialization is still lazy, and no
 window is prewarmed. Cairo avoids GPU device/shader startup for the text-only
-Status/Reports windows without changing their widgets, theme, or accessibility.
+tray windows without changing their widgets, theme, or accessibility. The GTK
+Scan/Settings/New Project/error windows reuse this default; GTK itself does not
+make snapshots live, so Scan has explicit Refresh and entries follow controller
+tracking sensitivity. CPU-performance improvement still requires measurement.
 Do not move environment mutation into the multithreaded tray controller.
 
 Instrumentation is compiled only with `#[cfg(debug_assertions)]`: standard debug
@@ -303,7 +319,7 @@ The only prebuilt target is Linux x86-64, dynamically linked against Debian 12
 libraries (glibc 2.36 baseline, PC/SC, SQLite, GTK4). Newer compatible distributions
 need those runtime libraries; NixOS uses a source build. Tray compatibility is
 protocol-based, not distribution-based: `ksni` requires an SNI/DBusMenu host on
-the session bus, with GTK4 for status/reports and Zenity for settings/reader scanning. CI's headless test
+the session bus, with GTK4 for windows. CI's headless test
 does not certify any particular desktop.
 
 #### Publish a release
@@ -343,7 +359,9 @@ is maintained.
 - `src/store.rs`: versioned SQLite schema/migration, project registry and lifecycle,
   transactional checkpoints, recovery, read-only discovery/reports, and report formatting.
 - `src/tray.rs`: SNI/DBusMenu presentation, controller, worker ownership, and
-  Zenity dialog lifecycle. `src/tray/reports.rs` owns the GTK4 project overview
+  GTK4 status window. `src/tray/dialogs.rs` owns GTK entry, reader-scan and error
+  widgets; the controller owns response identity/revision checks and a serialized
+  background PC/SC snapshot worker. `src/tray/reports.rs` owns the GTK4 project overview
   and delete confirmation widgets; callbacks send actions to the same controller.
   `src/tray/timing.rs` owns debug-only, opt-in activation/frame timing diagnostics.
   The tray uses the same watcher/store as the CLI, not a separate timer.
@@ -464,9 +482,29 @@ commit databases, WAL/SHM files, lock files, or private project history.
 
 ### Tray and dialogs
 
+All app windows use the existing GTK4 toolkit, compact header and shared theme
+subscription. New Project/Settings use labeled entries with current values,
+keyboard mnemonics, initial input focus and Enter/OK submission. Cancel, Escape
+and close do not apply. Each response is consumed before validation, closing once;
+both callback and controller identity guards reject duplicate/expired responses.
+Settings/project revisions reject stale submissions after other controller changes.
+Entries and OK disable while tracking; authoritative validation still drains worker
+events after blocking checks and joins the old watcher before mutation. Submission
+errors appear in a selectable GTK error window (and stderr), not as success.
+
+Scan Readers is a reusable, selectable, scrollable snapshot with Refresh. Its
+initial scan and manual refresh run on one background thread at a time, reusing
+`scan_text()` with no card-data commands or watcher mutation. Refresh disables
+while scanning; success updates text, and errors label any old snapshot as stale
+and allow retry. Reopening raises the existing snapshot without another scan.
+No periodic scan or tracking timer is added. GTK continues servicing all windows
+while a scan is pending. Shutdown stops the watcher and joins any scan thread;
+PC/SC's timeout-less native discovery calls can still delay that join.
+
 The GTK4 Reports window is independent of Status and reuses its compact header
 and desktop theme behavior. One controller-owned theme subscription serves both
-windows, including when hidden. GTK events are serviced when either window exists.
+windows and the other GTK dialogs, including when hidden. GTK events are serviced
+when any app window exists, even if only Scan, an entry or an error has opened.
 Reports reads every registered project, joining read-only totals with zero-session
 and archived rows. Only active projects populate the tray Projects menu; a stale
 selected name must not reintroduce an archived project.
@@ -484,7 +522,7 @@ confirmation with literal name, session count, total, Cancel as default, and a
 separately labeled destructive action. Cancel does not stop the watcher or mutate
 data. Switching databases cancels confirmation and invalidates queued report
 actions, including after switching away and back to the same path. Closing Reports
-cancels confirmation but does not stop tracking. Quit destroys both GTK windows.
+cancels confirmation but does not stop tracking. Quit destroys all GTK windows.
 
 Launch is idle: it does not create/recover a database or arm a project. Selecting
 a project automatically starts watching; a missing database is created then.
@@ -505,7 +543,7 @@ event queue so stale events cannot affect the new selection.
 
 Left-click opens/reuses a compact read-only GTK4 status window; right-click opens
 the host-rendered DBusMenu, including Report. Menu layout requests and opened/closed
-events must not open GTK/Zenity windows or arm a watcher. For a menu-opening flash,
+events must not open GTK windows or arm a watcher. For a menu-opening flash,
 distinguish the host's surface (such as DMS's `dms:tray-menu-window` layer) from the
 app's `Timeclock status` window before changing app window code.
 The status line is, for example,
@@ -519,7 +557,7 @@ Its light/dark appearance follows
 `org.freedesktop.portal.Settings`'s `org.freedesktop.appearance/color-scheme`, read
 asynchronously and monitored via `SettingChanged`. No preference or an unavailable
 portal preserves the configured GTK theme; no shell settings are changed. The
-subscription and pending read are shared by both windows and cancelled on controller
+subscription and pending read are shared by all windows and cancelled on controller
 shutdown. GTK
 events are serviced by the tray controller; there is no separate timer. Reports and reader scanning remain
 available while tracking. The selected project's total includes all persisted
@@ -531,9 +569,8 @@ Recovery keeps the worker alive; switching while reconnecting still joins it and
 discards its queued events. After fixing a terminal watcher error, reselecting the
 project retries.
 
-Every Zenity child and pipe thread is owned and reaped on completion, Quit,
-Ctrl-C, or SIGTERM. Closing scan output early may break its input pipe without making
-shutdown fail. Preserve literal names and escape menu underscores. Do not install
+Destroy all windows and cancel pending callbacks on Quit, Ctrl-C, or SIGTERM.
+Preserve literal names and escape menu underscores. Do not install
 DMS plugins, autostart entries, or desktop configuration as a side effect.
 
 ## Manual acceptance (temporary data only)
@@ -577,7 +614,7 @@ rm -r -- "$test_dir"
    no selected project, right-click and dismiss the menu repeatedly: no extra
    window or top-left flash should appear, and tracking must remain idle. Check
    both the first opening and subsequent openings. **Settings → Database path…**
-   shows the absolute path. Verify Zenity entry/cancellation and screen-reader
+   shows the absolute path. Verify entry/cancellation and screen-reader
    labels/focus. Left-click opens a
    compact read-only status window, even before recording a session; repeated
    clicks must reuse it. Verify keyboard focus, text selection/screen-reader
@@ -592,8 +629,15 @@ rm -r -- "$test_dir"
    long/Unicode project names, keyboard focus, and screen-reader labels for each
    Archived checkbox and Delete button. Totals-only updates must preserve focus.
    Missing databases must show an empty state without creating a file.
-2. Scan readers; set the exact reader and ATR. Enter/select projects with spaces,
-   underscores, and Unicode. Selection must automatically arm the watcher.
+2. Open Scan Readers before Status/Reports: verify it responds, shows selectable
+   literal reader names/ATRs, and Refresh updates after insertion/removal or reader
+   changes. Check failure/retry and that repeated opens reuse its snapshot. Open
+   Settings/New Project first in a fresh process too; verify light/dark theme and
+   compact headers, focus, Enter/OK, Escape/Cancel/close, and keyboard/screen-reader
+   access. Confirm the default Cairo renderer (or an explicit override); measure
+   CPU use separately rather than assuming software rendering proves improvement.
+   Set the exact reader and ATR. Enter/select projects with spaces, underscores,
+   literal markup/shell text and Unicode. Selection must automatically arm the watcher.
 3. Keep the status window open. Without a card: waiting for card, project, and
    total. Insert: `Tracking My Project (HH:MM:SS)`, with cumulative time updating and
    project/settings controls locked. Remove: `Paused My Project (HH:MM:SS)`, time

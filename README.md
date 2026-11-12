@@ -11,8 +11,8 @@ resume. Records stay in a local SQLite database; no account or network is needed
 - **Tray:** [`ksni`](https://github.com/iovxw/ksni) uses StatusNotifierItem (SNI)
   and DBusMenu, requiring a session DBus and a compatible host, such as KDE Plasma
   or DMS / DankMaterialShell. GNOME needs an AppIndicator extension. X11 and
-  Wayland work with a compatible host; legacy XEmbed-only trays do not. Settings
-  and reader-scan dialogs require Zenity; status and reports use GTK4 windows.
+  Wayland work with a compatible host; legacy XEmbed-only trays do not.
+  All app windows use GTK4 (Status, Reports, Scan Readers, New Project and Settings).
   Windows and macOS are not supported.
 - **CLI:** no desktop or tray host required; the same runtime libraries are needed.
 
@@ -23,7 +23,7 @@ Download `smartcard-timeclock-linux-x86_64.tar.gz` from
 On Debian/Ubuntu, install dependencies and the extracted binary:
 
 ```sh
-sudo apt-get install libpcsclite1 libsqlite3-0 libgtk-4-1 pcscd libccid pcsc-tools zenity
+sudo apt-get install libpcsclite1 libsqlite3-0 libgtk-4-1 pcscd libccid pcsc-tools
 sudo systemctl enable --now pcscd.socket
 tar -xzf smartcard-timeclock-linux-x86_64.tar.gz
 sudo install -m 755 smartcard-timeclock /usr/local/bin/smartcard-timeclock
@@ -84,6 +84,14 @@ grey idle, and red error. Remove the card before changing projects or settings.
 
 **Settings** changes the database, reader, or ATR. Choices last only for this run;
 repeat launch options to reuse them. The tray also accepts `--reader` and `--atr`.
+New Project and Settings have labeled GTK entries: **Cancel**, Escape or window
+close changes nothing; **OK** applies once and closes. Editing disables while
+tracking, and outdated submissions are rejected. **Scan readers…** opens a
+selectable snapshot with **Refresh** to update reader names, presence and ATRs,
+including while tracking. Scans run off the GTK thread, one at a time; errors stay
+visible with a retry option. Reopening the scan reuses its last snapshot rather
+than repeatedly scanning. These windows share Status/Reports' theme, compact
+header and Cairo default; there is no additional tracking timer.
 If an error persists, fix the reported problem and reselect the project to retry.
 
 The reports overview shows every registered project, including projects with no
